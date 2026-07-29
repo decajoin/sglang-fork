@@ -1623,6 +1623,30 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             chain.reverse()
         return BackupKV([target.id for target in chain])
 
+    def build_finished_prefix_backup(self, node_id: NodeId) -> Optional[BackupKV]:
+        """Restore the write-through invariant for a finished request's prefix.
+
+        Chunk-boundary nodes enter the tree through `cache_unfinished_req(
+        chunked=True)`, and `_inc_hit_count_and_check` deliberately skips their
+        backup trigger. The finish-time insert normally repairs that by
+        re-walking the same path with `chunked=False`, but when a component
+        reports an effective cache length of 0 the insert is an empty-key no-op
+        and the prefix stays out of the backup pool forever. (Hybrid-Mamba with
+        `extra_buffer` does exactly this whenever the last extend chunk is
+        shorter than `mamba_cache_chunk_size`, leaving `mamba_last_track_seqlen`
+        unset.) Touching the committed chain here restores the invariant:
+        *when a request finishes, its committed prefix is eligible for backup.*
+        """
+        node = self.node_by_id(node_id)
+        chain = []
+        while node is not self.root_node and not node.backuped:
+            chain.append(node)
+            node = node.parent
+        # Ancestors first, same ordering invariant as _build_backup_kv_action.
+        chain.reverse()
+        targets = [n.id for n in chain if self._inc_hit_count_and_check(n)]
+        return BackupKV(targets) if targets else None
+
     def commit_hicache_transfers(
         self,
         node_id: NodeId,

@@ -643,6 +643,15 @@ class UnifiedRadixCache(BasePrefixCache):
             if tail_free_start is not None:
                 segments.append((kv_indices_full[tail_free_start:], tail_free_start))
             self.token_to_kv_pool_allocator.free_segments(segments)
+
+            # A chunk-boundary prefix is inserted with chunked=True, which skips
+            # its write-through trigger; the insert above normally repairs that,
+            # but it is a no-op whenever a component truncates to length 0. Touch
+            # the committed chain so the prefix is still eligible for backup.
+            if self.cache_controller is not None and not self.is_write_back:
+                backup_kv = self.tree_core.build_finished_prefix_backup(req.last_node)
+                if backup_kv is not None:
+                    self._apply_cache_action(backup_kv)
         else:
             self.token_to_kv_pool_allocator.free_segment(
                 kv_indices[req.cache_protected_len :],

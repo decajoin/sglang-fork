@@ -365,6 +365,11 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
+    def build_finished_prefix_backup(self, node_id: NodeId) -> Optional[BackupKV]:
+        """Backup action for a finished request's committed prefix; None if nothing to do."""
+        ...
+
+    @abstractmethod
     def build_storage_backup_spec(
         self, node_id: NodeId, pass_prefix_keys: bool
     ) -> Optional[StorageBackupSpec]:
