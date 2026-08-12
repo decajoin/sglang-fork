@@ -22,7 +22,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     minimax_h3_probe_material,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
-    MINIMAX_H3_BASE_SHORT_EDGE,
     MINIMAX_H3_RESOLVED_PLAN_EXTRA_KEY,
     MiniMaxH3ResolvedPlan,
     minimax_h3_plan_from_batch,
@@ -295,10 +294,13 @@ def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
                     probe_facts[condition_index],
                     label=f"conditions[{condition_index}]",
                 )
+                # Reference video keeps its own display ratio but follows the
+                # target's short-edge tier, so a 1080p job does not silently
+                # condition on a 768p re-encode of its reference.
                 resolved = minimax_h3_resolve_spatial_shape(
                     width=width,
                     height=height,
-                    base_short_edge=MINIMAX_H3_BASE_SHORT_EDGE,
+                    base_short_edge=int(shape["base_short_edge"]),
                 )
             elif material.material_chain == "image.reference_preserve":
                 width, height = _display_shape(
