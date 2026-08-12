@@ -116,6 +116,9 @@ def _nearest_multiple(value: float, multiple: int) -> int:
 
 
 def _validate_base_short_edge(value: Any) -> int:
+    # Omitted short edge means the default tier, matching request validation.
+    if value is None:
+        return MINIMAX_H3_BASE_SHORT_EDGE
     try:
         short_edge = int(value)
     except (TypeError, ValueError) as exc:

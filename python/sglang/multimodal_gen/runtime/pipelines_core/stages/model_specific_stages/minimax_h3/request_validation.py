@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MINIMAX_H3_SUPPORTED_FPS,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
+    MINIMAX_H3_BASE_SHORT_EDGE,
     MINIMAX_H3_SUPPORTED_SHORT_EDGES,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
@@ -85,7 +86,13 @@ def _validate_target(target: Any, *, profile: MiniMaxH3TaskProfile) -> dict[str,
     # The canonical target has a deliberately small projection.  Transport
     # compatibility keys are ignored; only these three declared values are
     # validated and emitted below.
-    short_edge = _require_int(target.get("short_edge"), f"{path}.short_edge")
+    # short_edge is optional: omitting it selects the default 768 tier, so
+    # callers written against the single-resolution contract keep working
+    # whether or not they spell the field out.
+    raw_short_edge = target.get("short_edge")
+    if raw_short_edge is None:
+        raw_short_edge = MINIMAX_H3_BASE_SHORT_EDGE
+    short_edge = _require_int(raw_short_edge, f"{path}.short_edge")
     if short_edge not in MINIMAX_H3_SUPPORTED_SHORT_EDGES:
         raise ValueError(
             f"{path}.short_edge must be one of "

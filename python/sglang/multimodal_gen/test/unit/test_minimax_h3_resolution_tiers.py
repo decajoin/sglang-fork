@@ -59,6 +59,37 @@ def test_768_remains_the_default_short_edge():
         assert (shape["width"], shape["height"]) == expected
 
 
+@pytest.mark.parametrize("aspect_ratio", MINIMAX_H3_FINITE_ASPECT_RATIOS)
+@pytest.mark.parametrize("omitted", [True, False])
+def test_absent_short_edge_defaults_to_the_768_tier(aspect_ratio, omitted):
+    """A target without short_edge must behave exactly like an explicit 768."""
+
+    target = {"aspect_ratio": aspect_ratio, "duration_seconds": 5.0}
+    if not omitted:
+        target["short_edge"] = None
+    canonical = minimax_h3_validate_canonical_request(
+        task="t2va", prompt="a raccoon", conditions=[], target=target
+    )
+    assert canonical["target"]["short_edge"] == 768
+
+    explicit = minimax_h3_validate_canonical_request(
+        task="t2va",
+        prompt="a raccoon",
+        conditions=[],
+        target={
+            "short_edge": 768,
+            "aspect_ratio": aspect_ratio,
+            "duration_seconds": 5.0,
+        },
+    )
+    default_shape = minimax_h3_resolve_plan(canonical).shape
+    explicit_shape = minimax_h3_resolve_plan(explicit).shape
+    assert default_shape == explicit_shape
+    assert (default_shape["width"], default_shape["height"]) == _TIER_768_CANVASES[
+        aspect_ratio
+    ]
+
+
 @pytest.mark.parametrize("short_edge", MINIMAX_H3_SUPPORTED_SHORT_EDGES)
 @pytest.mark.parametrize("aspect_ratio", MINIMAX_H3_FINITE_ASPECT_RATIOS)
 def test_every_tier_is_grid_aligned(short_edge, aspect_ratio):
@@ -139,7 +170,7 @@ def test_unsupported_tiers_are_rejected(short_edge):
         )
 
 
-@pytest.mark.parametrize("short_edge", [768.0, "768", True, None])
+@pytest.mark.parametrize("short_edge", [768.0, "768", True])
 def test_non_integer_tiers_are_rejected(short_edge):
     with pytest.raises(ValueError, match="short_edge must be an integer"):
         minimax_h3_validate_canonical_request(
