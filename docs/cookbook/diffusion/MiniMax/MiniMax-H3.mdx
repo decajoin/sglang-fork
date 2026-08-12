@@ -746,7 +746,19 @@ real H3 validation runs.
 
 - MiniMax-H3 produces the canonical 24 fps output; request duration is expressed through `target.duration_seconds`.
 - `target.duration_seconds` must be between 4 and 15 seconds, inclusive. The command picker defaults to the verified 5-second profile.
-- Use a 768-pixel short edge for the released quality recipe. The aligned output dimensions are derived from `target.aspect_ratio`.
+- `target.short_edge` selects a resolution tier: `360`, `480`, `540`, `720`, `768`, or `1080`. The aligned output dimensions are derived from it together with `target.aspect_ratio`. Use `768` for the released quality recipe — it is the only tier the published benchmarks and the `quality: "high"` Cache-DiT profile cover.
+- Each tier resolves the nominal short edge against its own soft area cap, then rounds both axes independently to the 32-pixel grid, so the effective short edge can land slightly below the requested tier (`720` at 16:9 resolves to 1280×704). Resolved canvases per tier:
+
+  | `short_edge` | 21:9 | 16:9 | 4:3 | 1:1 | 3:4 | 9:16 |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 360 | 736×320 | 640×352 | 480×352 | 352×352 | 352×480 | 352×640 |
+  | 480 | 960×416 | 832×480 | 640×480 | 480×480 | 480×640 | 480×832 |
+  | 540 | 1088×480 | 960×544 | 704×544 | 544×544 | 544×704 | 544×960 |
+  | 720 | 1440×608 | 1280×704 | 960×704 | 704×704 | 704×960 | 704×1280 |
+  | 768 | 1536×672 | 1344×768 | 1024×768 | 768×768 | 768×1024 | 768×1344 |
+  | 1080 | 2176×928 | 1920×1056 | 1440×1088 | 1088×1088 | 1088×1440 | 1056×1920 |
+
+- Latency and memory scale with canvas area: the 1080 tier is roughly 2× the 768 tier and the 360 tier roughly 0.22×. Add every served size to `--warmup-resolutions`, otherwise the first request at each new tier pays the cold-start cost.
 - `flow_shift` controls video diffusion and `audio_flow_shift` controls audio diffusion.
 - V2V uses `task: "ref2va"` with a `video` or `video_audio` reference; it is served by the `Ref2VA` partition and is not a separate public task value.
 - `conditions[].start_time_seconds` selects a non-negative offset for a video reference. Its visual and audio streams are always sought together.

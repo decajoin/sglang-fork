@@ -7,9 +7,13 @@ Stages never branch on task names; skips must be explicit in the plan.
 
 Scope notes (adapt_shape_v1):
 - all target and material-derived ratios use the single adaptive spatial
-  resolver exported by this module. It starts from a 768px nominal short edge,
-  applies the 768x1344 soft area cap, then rounds both axes independently to
-  the nearest 32px grid.
+  resolver exported by this module. It starts from the requested nominal short
+  edge, applies that tier's soft area cap, then rounds both axes independently
+  to the nearest 32px grid.
+- the short edge is a tier drawn from MINIMAX_H3_SUPPORTED_SHORT_EDGES (360p to
+  1080p). Each tier's soft area cap is its own 1344:768 widest-canvas budget
+  scaled by the square of the short edge, so every tier reproduces the 768 tier's
+  geometry policy at its own scale.
 - ``auto`` uses the task profile: t2va/ref2va resolve to the 16:9 policy
   default, while fl2va defers geometry until material probe facts are
   available. Consumers must fail fast if required evidence is missing.
@@ -40,10 +44,25 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 
 MINIMAX_H3_SHAPE_POLICY_VERSION = "adapt_shape_v1"
 MINIMAX_H3_BASE_SHORT_EDGE = 768
-MINIMAX_H3_MAX_PIXELS = MINIMAX_H3_BASE_SHORT_EDGE * 1344
+# Supported short-edge tiers, 360p through 1080p. Discrete by design: the
+# resolved canvas set stays enumerable, which keeps warmup coverage and the
+# breakable-CUDA-graph shape cache bounded.
+MINIMAX_H3_SUPPORTED_SHORT_EDGES: tuple[int, ...] = (360, 480, 540, 720, 768, 1080)
+# Widest canvas the 768 tier admits (768x1344). Every tier scales this budget by
+# the square of its short edge, so the 768 tier is unchanged and the others
+# apply the identical policy at their own scale.
+MINIMAX_H3_MAX_ASPECT_AREA_RATIO = 1344.0 / 768.0
 MINIMAX_H3_CANVAS_MULTIPLE = 32
 MINIMAX_H3_MIN_ASPECT_RATIO = 1.0 / 4.0
 MINIMAX_H3_MAX_ASPECT_RATIO = 4.0
+
+
+def minimax_h3_max_pixels(short_edge: int) -> int:
+    """Soft area cap for one short-edge tier, before 32px grid rounding."""
+    return int(round(short_edge * short_edge * MINIMAX_H3_MAX_ASPECT_AREA_RATIO))
+
+
+MINIMAX_H3_MAX_PIXELS = minimax_h3_max_pixels(MINIMAX_H3_BASE_SHORT_EDGE)
 
 
 class MiniMaxH3MaterialPlanItem(msgspec.Struct, frozen=True):
@@ -100,10 +119,15 @@ def _validate_base_short_edge(value: Any) -> int:
     try:
         short_edge = int(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError("target.short_edge must be 768") from exc
-    if short_edge != MINIMAX_H3_BASE_SHORT_EDGE or value != short_edge:
         raise ValueError(
-            f"target.short_edge must be 768 for MiniMax H3 shape policy v2, got {value!r}"
+            "target.short_edge must be one of "
+            f"{list(MINIMAX_H3_SUPPORTED_SHORT_EDGES)}"
+        ) from exc
+    if short_edge not in MINIMAX_H3_SUPPORTED_SHORT_EDGES or value != short_edge:
+        raise ValueError(
+            "target.short_edge must be one of "
+            f"{list(MINIMAX_H3_SUPPORTED_SHORT_EDGES)} for MiniMax H3 shape "
+            f"policy v2, got {value!r}"
         )
     return short_edge
 
@@ -119,8 +143,12 @@ def minimax_h3_resolve_spatial_shape(
     This is the only implementation of adaptive target geometry. Callers may
     pass an explicit aspect-ratio pair or probed display dimensions; only the
     ratio is significant. The supported ratio range is inclusive 1:4 to 4:1.
-    The returned dimensions are always 32px aligned; nearest-grid rounding may
-    leave the final area slightly above the pre-round soft pixel budget.
+    ``base_short_edge`` selects one of MINIMAX_H3_SUPPORTED_SHORT_EDGES, which
+    sets both the nominal short edge and the soft area cap. The returned
+    dimensions are always 32px aligned; nearest-grid rounding may leave the
+    final area slightly above the pre-round soft pixel budget, and may leave the
+    effective short edge just off the requested tier (720 resolves to 704 at
+    16:9, for instance).
     """
     base_short_edge = _validate_base_short_edge(base_short_edge)
     try:
@@ -153,10 +181,11 @@ def minimax_h3_resolve_spatial_shape(
     else:
         nominal_width = float(base_short_edge)
         nominal_height = float(base_short_edge) / ratio
+    max_pixels = minimax_h3_max_pixels(base_short_edge)
     nominal_area = nominal_width * nominal_height
-    if nominal_area > MINIMAX_H3_MAX_PIXELS:
+    if nominal_area > max_pixels:
         size_mode = "area"
-        scale = math.sqrt(float(MINIMAX_H3_MAX_PIXELS) / nominal_area)
+        scale = math.sqrt(float(max_pixels) / nominal_area)
         nominal_width *= scale
         nominal_height *= scale
     else:
@@ -171,7 +200,7 @@ def minimax_h3_resolve_spatial_shape(
         "base_short_edge": base_short_edge,
         "effective_short_edge": min(resolved_width, resolved_height),
         "size_mode": size_mode,
-        "max_pixels": MINIMAX_H3_MAX_PIXELS,
+        "max_pixels": max_pixels,
         "multiple": MINIMAX_H3_CANVAS_MULTIPLE,
         "rounding": "nearest",
         "width": resolved_width,
@@ -440,7 +469,9 @@ __all__ = [
     "MINIMAX_H3_CANONICAL_REQUEST_EXTRA_KEY",
     "MINIMAX_H3_MAX_PIXELS",
     "MINIMAX_H3_RESOLVED_PLAN_EXTRA_KEY",
+    "MINIMAX_H3_SUPPORTED_SHORT_EDGES",
     "MiniMaxH3ResolvedPlan",
+    "minimax_h3_max_pixels",
     "minimax_h3_plan_from_batch",
     "minimax_h3_resolve_plan",
     "minimax_h3_resolve_spatial_shape",
