@@ -383,6 +383,36 @@ Poll and download any conditioned request with the same job-status and
 content endpoints used in the T2VA example. Server-local `file://` URIs must
 refer to files visible inside the SGLang server environment.
 
+### Reference-image preprocessing and memory
+
+Every Ref2VA reference **image** is resized to a 2048px short edge before it
+reaches Qwen3-VL and the video VAE, upscaling small sources when needed. Shrinking
+images client-side therefore saves nothing. Reference **videos** are unaffected by
+this: they follow the request's `target.short_edge` tier.
+
+At 2048px each reference image contributes roughly 4096 DiT tokens plus about as
+many Qwen3-VL visual tokens, so reference-heavy requests can exhaust memory on
+32 GB-class GPUs. `--minimax-h3-reference-image-short-edge` lowers that tier
+server-wide; token count scales with its square, so 1024 costs a quarter of the
+default and 1440 about half:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant ref2va \
+  --minimax-h3-reference-image-short-edge 1440
+```
+
+The value must be a positive multiple of 32. Leaving it unset keeps the released
+2048px contract.
+
+<Warning>
+This is a departure from the checkpoint's audited preprocessing. It trades
+conditioning fidelity — subject identity, fine texture, legible text in the
+reference — for memory. Validate output quality at the tier you pick before
+using it in production.
+</Warning>
+
 ## 5. Turbo LoRA for few-step generation
 
 [`larryvrh/MiniMax-H3-Turbo-Lora`](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora) distills the native **FL2VA** DiT for usable **4–8 step** generation. On `--model-variant fl2va`, use it with **`t2va`** or **`fl2va`** from section 4 and set `"num_inference_steps": 4` or `8` instead of `50`. **`ref2va`** uses a separate checkpoint partition and is not validated with this LoRA.
