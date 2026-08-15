@@ -11,7 +11,7 @@ import math
 import os
 import struct
 from contextlib import ExitStack
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -129,6 +129,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "local_embedding_layout",
         "packed_seq_params",
         "refiner_packed_seq_params",
+        "segment_attn_bounds",
     }
 )
 
@@ -447,6 +448,113 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         return out
 
 
+# Backends whose fixed-length ``forward`` accepts [B, S, H, D] with a query
+# length that differs from the key/value length, which is what the segment
+# split below needs. Anything else keeps the dense varlen path.
+_SEGMENT_SPARSE_BACKENDS = frozenset(
+    {
+        AttentionBackendEnum.FA,
+        AttentionBackendEnum.SAGE_ATTN,
+        AttentionBackendEnum.TORCH_SDPA,
+        AttentionBackendEnum.TORCH_CUDNN_SDPA,
+        AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
+    }
+)
+
+_segment_sparse_fallback_logged = False
+
+
+class MiniMaxH3SegmentBands(NamedTuple):
+    """Which query rows may not attend to the generated target rows.
+
+    ``ranges`` are the restricted query row ranges in ascending order; each is
+    half-open, contiguous, and disjoint from the others. Rows outside them keep
+    full attention. Restricted rows attend to ``[0, kv_stop)``.
+    """
+
+    kv_stop: int
+    ranges: tuple[tuple[int, int], ...]
+
+
+def _segment_split_usable(
+    attention: MiniMaxH3Attention,
+    bands: MiniMaxH3SegmentBands | None,
+    *,
+    used: int,
+    total_rows: int,
+) -> bool:
+    """Whether this step can run the split instead of dense attention.
+
+    The bands were already validated against the live row count when the
+    request entered the DiT; this only re-checks them against the rows actually
+    present here, which differ once a rank holds an all-to-all'd shard.
+    """
+
+    global _segment_sparse_fallback_logged
+
+    if bands is None:
+        return False
+    if attention._attention_backend_enum not in _SEGMENT_SPARSE_BACKENDS:
+        if not _segment_sparse_fallback_logged:
+            _segment_sparse_fallback_logged = True
+            logger.warning(
+                "MiniMax H3 segment-sparse attention is not implemented for "
+                "the %s backend; falling back to dense attention.",
+                attention._attention_backend_enum,
+            )
+        return False
+    return bands.kv_stop <= used <= total_rows
+
+
+def _minimax_h3_segment_sparse_attention(
+    attention: MiniMaxH3Attention,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    used: int,
+    bands: MiniMaxH3SegmentBands,
+) -> torch.Tensor:
+    """Attend with ``bands.ranges`` restricted to the ``[0, kv_stop)`` prefix.
+
+    Dropping the reference->target direction cuts one rectangle out of the
+    score matrix. Because the cut is defined by whole query rows, the matrix
+    splits into row bands that are contiguous and disjoint, so each band is one
+    ordinary fixed-length attention call and the results concatenate by row
+    index -- softmax normalizes across keys within a row, and every row's full
+    key set lives in a single call, so no online-softmax merge is needed.
+
+    Restricted rows still serve as keys for the target, so conditioning is
+    unchanged in that direction; only their own representation stops being
+    refined by the tokens they condition.
+
+    The ``[used, seq_len)`` padding tail is left at zero, matching the sage
+    backend's varlen handling. Padding rows never reach the output: they are
+    excluded by ``img_pos_for_infer_output_info``.
+    """
+
+    impl = attention._attention_impl
+    out = torch.zeros_like(q)
+
+    def _band(start: int, stop: int, kv_stop: int) -> None:
+        if start >= stop:
+            return
+        out[start:stop] = impl.forward(
+            q[start:stop].unsqueeze(0),
+            k[:kv_stop].unsqueeze(0),
+            v[:kv_stop].unsqueeze(0),
+            None,
+        )[0]
+
+    cursor = 0
+    for start, stop in bands.ranges:
+        _band(cursor, start, used)  # unrestricted rows see everything
+        _band(start, stop, bands.kv_stop)  # restricted rows see the prefix
+        cursor = stop
+    _band(cursor, used, used)
+    return out
+
+
 def _minimax_h3_attention_core_impl(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -458,12 +566,18 @@ def _minimax_h3_attention_core_impl(
     max_seqlen: int,
     ulysses_active: bool,
     ring_active: bool = False,
+    segment_attn_bounds: MiniMaxH3SegmentBands | None = None,
 ) -> torch.Tensor:
     """Dynamic varlen attention and Ulysses/Ring collectives.
 
     This is the narrow BCG break point: projections, normalization, RoPE,
     residuals, and MLPs remain captured while the dynamic packed attention
     kernel and sequence-parallel collectives execute eagerly.
+
+    ``segment_attn_bounds`` opts into the reference/target segment split; see
+    ``_minimax_h3_segment_sparse_attention``. It is ignored under ring
+    parallelism, whose contiguous row chunking is incompatible with splitting
+    by query band.
     """
 
     if ulysses_active:
@@ -499,6 +613,21 @@ def _minimax_h3_attention_core_impl(
             softmax_scale=attention.softmax_scale,
             real_seq_len=max_seqlen,
             ring_ws=ring_ws,
+        )
+    elif _segment_split_usable(
+        attention,
+        segment_attn_bounds,
+        used=int(max_seqlen),
+        total_rows=int(q.shape[0]),
+    ):
+        assert segment_attn_bounds is not None
+        out = _minimax_h3_segment_sparse_attention(
+            attention,
+            q,
+            k,
+            v,
+            used=int(max_seqlen),
+            bands=segment_attn_bounds,
         )
     else:
         out = attention._attention_impl.forward_varlen(
@@ -681,6 +810,7 @@ class MiniMaxH3Attention(nn.Module):
         max_seqlen: int,
         ulysses_active: bool = False,
         ring_active: bool = False,
+        segment_attn_bounds: MiniMaxH3SegmentBands | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -748,6 +878,7 @@ class MiniMaxH3Attention(nn.Module):
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            segment_attn_bounds=segment_attn_bounds,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -1258,6 +1389,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         ulysses_active: bool = False,
         ring_active: bool = False,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
+        segment_attn_bounds: MiniMaxH3SegmentBands | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -1287,6 +1419,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            segment_attn_bounds=segment_attn_bounds,
         )
         x = _modulate_gate(
             residual,
@@ -1674,6 +1807,40 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             return psp.get(field)
         return getattr(psp, field, None)
 
+    @staticmethod
+    def _segment_attn_bounds(
+        raw: Any,
+        *,
+        used: int,
+    ) -> MiniMaxH3SegmentBands | None:
+        """Validate the optional restricted query bands against the live rows.
+
+        Returns the bands, or ``None`` when the caller opted out. Every range
+        must be non-empty, ascending, disjoint, and contained in the prefix the
+        restricted rows may attend to; anything else is a producer bug and
+        fails fast rather than silently attending to the wrong rows.
+        """
+
+        if raw is None:
+            return None
+        kv_stop, ranges = int(raw[0]), tuple((int(a), int(b)) for a, b in raw[1])
+        if not ranges:
+            raise ValueError("segment_attn_bounds must hold at least one range")
+        if not 0 < kv_stop <= int(used):
+            raise ValueError(
+                "segment_attn_bounds kv_stop must be in (0, "
+                f"{int(used)}] live rows, got {kv_stop}"
+            )
+        cursor = 0
+        for start, stop in ranges:
+            if not cursor <= start < stop <= kv_stop:
+                raise ValueError(
+                    "segment_attn_bounds ranges must be ascending, disjoint, "
+                    f"non-empty and within [0, {kv_stop}), got {ranges!r}"
+                )
+            cursor = stop
+        return MiniMaxH3SegmentBands(kv_stop=kv_stop, ranges=ranges)
+
     def refine_prompt_embeds(
         self,
         prompt_embeds: torch.Tensor,
@@ -1971,6 +2138,10 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         refiner_max = int(
             self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q")
         )
+        segment_attn_bounds = self._segment_attn_bounds(
+            kwargs.get("segment_attn_bounds"),
+            used=max_seqlen,
+        )
 
         if x.dim() != 3 or x.shape[0] != 1:
             raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
@@ -2117,6 +2288,10 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 adaln_params=(
                     None if block_adaln_params is None else block_adaln_params[index]
                 ),
+                # Global packed-row coordinates: Ulysses restores the full
+                # sequence inside attention before the split runs, and ring
+                # (whose row chunking is incompatible) ignores this.
+                segment_attn_bounds=segment_attn_bounds,
             )
         video_logits, audio_logits = self.final_layer(
             hidden,

@@ -105,6 +105,7 @@ class MiniMaxH3DenoiseBranch:
         text_embeddings: torch.Tensor,
         token_tags: torch.Tensor,
         device: torch.device,
+        segment_sparse_attn: bool = False,
     ) -> None:
         seq_len = int(packed["seq_len"])
         self.seq_len = seq_len
@@ -228,6 +229,65 @@ class MiniMaxH3DenoiseBranch:
                 "max_seqlen_q": text_len,
             },
         }
+        bounds = (
+            self._resolve_segment_attn_bounds(text_len=text_len, used=int(cu[1]))
+            if segment_sparse_attn
+            else None
+        )
+        self.segment_attn_bounds = bounds
+        if bounds is not None:
+            self.static_kwargs["segment_attn_bounds"] = bounds
+
+    def _resolve_segment_attn_bounds(
+        self,
+        *,
+        text_len: int,
+        used: int,
+    ) -> tuple[int, tuple[tuple[int, int], ...]] | None:
+        """Locate the restricted VISUAL reference rows, or ``None`` if none.
+
+        ref2va packs every reference row between the text prefix and the
+        generated target suffix. Only the visual ones are restricted here:
+        reference audio keeps full attention because it is a tiny minority of
+        the sequence (about 1% of the reference rows at 12s) whose
+        representation is therefore almost entirely context-derived, and
+        cutting it off the target measurably destroys soundtrack fidelity --
+        for ~1% of the saving, which is not a trade worth making.
+
+        Reference rows still all serve as keys for each other, so ``kv_stop``
+        stays at the end of the whole reference span. Visual rows may form
+        several ranges once a video block interleaves its audio rows, so this
+        returns them as an ascending list rather than one band.
+
+        Returns ``None`` unless the whole reference span really is the
+        contiguous range ``[text_len, text_len + n_ref)``; a layout that ever
+        interleaved reference and target rows would break the row-band split,
+        so the optimization disables itself rather than attend to wrong rows.
+        """
+
+        visual = self.img_cond_seq_idx
+        n_ref = int(visual.numel()) + int(self.audio_ref_seq_idx.numel())
+        if n_ref <= 0 or int(visual.numel()) == 0:
+            return None
+        start, stop = int(text_len), int(text_len) + n_ref
+        if stop > used:
+            return None
+        expected = torch.arange(start, stop, device=visual.device)
+        actual = torch.cat([visual, self.audio_ref_seq_idx]).sort().values
+        if actual.shape != expected.shape or not bool(torch.equal(actual, expected)):
+            return None
+
+        # Collapse the visual rows into ascending contiguous runs.
+        rows = visual.sort().values.tolist()
+        ranges: list[tuple[int, int]] = []
+        run_start = previous = rows[0]
+        for row in rows[1:]:
+            if row != previous + 1:
+                ranges.append((run_start, previous + 1))
+                run_start = row
+            previous = row
+        ranges.append((run_start, previous + 1))
+        return stop, tuple(ranges)
 
     def forward_kwargs(
         self,

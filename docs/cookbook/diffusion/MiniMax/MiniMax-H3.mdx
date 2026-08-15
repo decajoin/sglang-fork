@@ -459,6 +459,47 @@ reference — for memory. Validate output quality at the tier you pick before
 using it in production.
 </Warning>
 
+### Segment-sparse attention for reference-heavy requests
+
+The DiT runs one non-causal attention over the whole packed sequence
+`[text | reference | target audio | target video]`, so cost grows with the
+square of the sequence length. A reference video is as long as the generated
+video, which makes it the single largest contributor: for a 5s 768p job it
+roughly doubles the sequence, and therefore quadruples attention work.
+
+`--minimax-h3-segment-sparse-attn` stops **visual** reference rows from attending
+to the generated target rows. References still condition the target — only their
+own representation stops being refined by the tokens they condition — which
+removes the reference-by-target quadrant of the score matrix. Measured on 12s
+768p jobs, this cuts total request time by **12–14%** with a reference video and
+**1–4%** with reference images (images contribute half their tokens through the
+text segment, which is not restricted).
+
+Reference **audio** deliberately keeps full attention. It is roughly 1% of the
+reference rows, so its representation is almost entirely context-derived, and
+restricting it measurably destroys soundtrack fidelity for ~1% of the saving.
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant ref2va \
+  --minimax-h3-segment-sparse-attn
+```
+
+The flag applies only to `ref2va` requests carrying a visual reference. FL2VA
+keyframes anchor frames of the generated video rather than conditioning it from
+outside, so they are never restricted; T2VA and audio-only ref2va have no visual
+reference rows and the flag becomes a no-op. It is also ignored under
+`--ring-degree`, whose contiguous row chunking is incompatible with splitting
+attention by query band; `--ulysses-degree` works normally.
+
+<Warning>
+This changes the function the checkpoint was trained for — H3 was trained with
+full bidirectional attention across the packed sequence. Validate output quality
+before enabling it in production; the effect is largest on jobs whose references
+carry fine detail that the model must resolve against the generated content.
+</Warning>
+
 ## 5. LoRA recipes
 
 H3 accepts both native fused adapters and standard Diffusers/PEFT adapters.

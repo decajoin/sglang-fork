@@ -47,6 +47,29 @@ _REF2VA_VIDEO_CHAINS = {
     "video_audio.reference_preserve",
 }
 
+# Material chains whose packed rows are true references: they condition the
+# target without being part of its timeline. fl2va's "image.target_canvas"
+# keyframes are deliberately absent -- they anchor frames of the generated
+# video itself, and at one or two latent frames they are far too small for the
+# segment split to pay for the semantic change.
+_REF2VA_REFERENCE_CHAINS = {
+    "image.reference_preserve",
+    "audio",
+} | _REF2VA_VIDEO_CHAINS
+
+
+def _segment_sparse_attn_enabled(plan: Any, server_args: ServerArgs) -> bool:
+    """Whether this request may drop the reference->target attention band."""
+
+    if not bool(getattr(server_args, "minimax_h3_segment_sparse_attn", False)):
+        return False
+    if plan is None or str(plan.task) != "ref2va":
+        return False
+    return any(
+        str(material.material_chain) in _REF2VA_REFERENCE_CHAINS
+        for material in plan.materials
+    )
+
 
 def minimax_h3_condition_noise_aug(sampling: Any) -> tuple[float, float]:
     """Resolve condition timesteps using the model defaults."""
@@ -639,6 +662,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 text_embeddings=emb["hidden_states"],
                 token_tags=tags,
                 device=device,
+                segment_sparse_attn=_segment_sparse_attn_enabled(ctx.plan, server_args),
             )
             _precompute_refined_prompt_embeds(
                 model,

@@ -341,6 +341,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # it reaches Qwen3-VL and the video VAE. None keeps the released 2048px
     # preprocessing contract.
     minimax_h3_reference_image_short_edge: int | None = None
+    # MiniMax-H3 ref2va: drop the reference->target attention band. Off keeps
+    # the checkpoint's full bidirectional attention.
+    minimax_h3_segment_sparse_attn: bool = False
     _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
 
     # ComfyUI integration
@@ -2054,6 +2057,23 @@ class ServerArgs(DisaggServerArgsMixin):
                 "fidelity for memory; unset keeps the released 2048px contract. "
                 "Reference videos are unaffected -- they follow the request's "
                 "target.short_edge tier."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-segment-sparse-attn",
+            action=StoreBoolean,
+            default=ServerArgs.minimax_h3_segment_sparse_attn,
+            help=(
+                "MiniMax-H3 ref2va only: stop VISUAL reference rows from "
+                "attending to the generated target rows. References still "
+                "condition the target -- only their own representation stops "
+                "being refined by it. Measured 12-14%% faster end to end with a "
+                "reference video, 1-4%% with reference images. Reference audio "
+                "keeps full attention: restricting it destroys soundtrack "
+                "fidelity for ~1%% of the saving. This changes the function the "
+                "checkpoint was trained for, so validate quality before "
+                "enabling it in production. Ignored under --ring-degree and for "
+                "fl2va/t2va."
             ),
         )
         parser.add_argument(
