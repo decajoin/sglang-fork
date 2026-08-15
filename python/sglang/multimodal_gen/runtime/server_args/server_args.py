@@ -341,6 +341,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # it reaches Qwen3-VL and the video VAE. None keeps the released 2048px
     # preprocessing contract.
     minimax_h3_reference_image_short_edge: int | None = None
+    # MiniMax-H3 ref2va: short-edge tier every reference VIDEO is resized to.
+    # None keeps the released behaviour of following the target's own tier.
+    minimax_h3_reference_video_short_edge: int | None = None
     _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
 
     # ComfyUI integration
@@ -2052,8 +2055,27 @@ class ServerArgs(DisaggServerArgsMixin):
                 "quarter of the 2048 default. Lowering it departs from the "
                 "checkpoint's audited preprocessing and trades conditioning "
                 "fidelity for memory; unset keeps the released 2048px contract. "
-                "Reference videos are unaffected -- they follow the request's "
-                "target.short_edge tier."
+                "Reference videos are unaffected -- see "
+                "--minimax-h3-reference-video-short-edge for those."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-reference-video-short-edge",
+            type=int,
+            default=ServerArgs.minimax_h3_reference_video_short_edge,
+            help=(
+                "MiniMax-H3 ref2va only: short-edge tier every reference VIDEO "
+                "is resized to. Unset keeps the released behaviour of following "
+                "the request's own target.short_edge, so a 1080p job does not "
+                "condition on a 768p re-encode of its reference. A reference "
+                "video is the single largest contributor to the packed "
+                "sequence -- at 12s/768p it is 46% of the rows -- and its row "
+                "count scales with the square of this value, so 540 leaves 49% "
+                "of them. Attention cost is quadratic in the sequence, so the "
+                "saving compounds. Lowering it trades conditioning fidelity "
+                "(fine texture, legible text, frame-accurate detail) for "
+                "latency and memory; validate quality at the tier you pick, "
+                "especially for fully_preserved references."
             ),
         )
         parser.add_argument(

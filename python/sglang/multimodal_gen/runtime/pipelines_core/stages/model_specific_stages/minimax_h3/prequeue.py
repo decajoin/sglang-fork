@@ -254,6 +254,22 @@ def _configured_reference_image_short_edge() -> int | None:
     return getattr(server_args, "minimax_h3_reference_image_short_edge", None)
 
 
+def _configured_reference_video_short_edge() -> int | None:
+    """Server-configured ref2va video short edge, ``None`` to follow the target.
+
+    Same reasoning as the image reader above: pre-queue admission runs outside
+    the stage machinery, and callers without a server keep released behaviour.
+    """
+
+    from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+    try:
+        server_args = get_global_server_args()
+    except ValueError:
+        return None
+    return getattr(server_args, "minimax_h3_reference_video_short_edge", None)
+
+
 def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
     """Freeze MiniMax H3 media/shape facts before queue admission."""
 
@@ -311,13 +327,24 @@ def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
                     probe_facts[condition_index],
                     label=f"conditions[{condition_index}]",
                 )
-                # Reference video keeps its own display ratio but follows the
-                # target's short-edge tier, so a 1080p job does not silently
-                # condition on a 768p re-encode of its reference.
+                # Reference video keeps its own display ratio. Unset, it follows
+                # the target's short-edge tier, so a 1080p job does not silently
+                # condition on a 768p re-encode of its reference; the server can
+                # pin a lower tier to cut the largest segment of the packed
+                # sequence, at the cost of conditioning detail.
+                from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.reference_encoding import (
+                    minimax_h3_validate_reference_video_short_edge,
+                )
+
+                configured = _configured_reference_video_short_edge()
                 resolved = minimax_h3_resolve_spatial_shape(
                     width=width,
                     height=height,
-                    base_short_edge=int(shape["base_short_edge"]),
+                    base_short_edge=(
+                        int(shape["base_short_edge"])
+                        if configured is None
+                        else minimax_h3_validate_reference_video_short_edge(configured)
+                    ),
                 )
             elif material.material_chain == "image.reference_preserve":
                 width, height = _display_shape(

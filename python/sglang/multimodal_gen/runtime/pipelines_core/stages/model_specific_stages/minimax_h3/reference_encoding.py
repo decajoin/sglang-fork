@@ -142,6 +142,33 @@ def minimax_h3_validate_reference_image_short_edge(value: Any) -> int:
     return short_edge
 
 
+def minimax_h3_validate_reference_video_short_edge(value: Any) -> int:
+    """Validate a reference-video short edge against the supported tiers.
+
+    Reference video runs through the same spatial shape policy as the target
+    canvas, so it is restricted to the same discrete tiers rather than the 32px
+    grid the reference-image knob uses. Keeping the canvas set enumerable is
+    what bounds warmup coverage and the breakable-CUDA-graph shape cache.
+    """
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
+        MINIMAX_H3_SUPPORTED_SHORT_EDGES,
+    )
+
+    try:
+        short_edge = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"reference video short edge must be an integer, got {value!r}"
+        ) from exc
+    if value != short_edge or short_edge not in MINIMAX_H3_SUPPORTED_SHORT_EDGES:
+        raise ValueError(
+            "reference video short edge must be one of "
+            f"{list(MINIMAX_H3_SUPPORTED_SHORT_EDGES)}, got {value!r}"
+        )
+    return short_edge
+
+
 def minimax_h3_resolve_reference_image_shape(
     *,
     width: int | float,
