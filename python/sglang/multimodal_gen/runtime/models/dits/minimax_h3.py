@@ -7,6 +7,7 @@ contract accepts packed inference keyword arguments and returns packed logits.
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 import struct
@@ -445,6 +446,30 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         hidden = nn.functional.silu(hidden)
         out, _ = self.proj_out(hidden)
         return out
+
+
+@functools.lru_cache(maxsize=1)
+def _row_modality_tags_publisher():
+    """Resolve the sparge_attn tag publisher, or a no-op if it is unavailable.
+
+    Only sparge_attn consumes modality tags. Resolving it lazily and degrading
+    to ``nullcontext`` keeps every other backend -- and a tree without the
+    SpargeAttn extension -- on exactly the path it had before.
+    """
+    try:
+        from sglang.multimodal_gen.runtime.layers.attention.backends.sparge_attn import (
+            sparge_row_modality_tags,
+        )
+
+        return sparge_row_modality_tags
+    except Exception:  # pragma: no cover - defensive
+        import contextlib
+
+        return lambda _tags: contextlib.nullcontext()
+
+
+def _row_modality_tags_ctx(tags):
+    return _row_modality_tags_publisher()(tags)
 
 
 def _minimax_h3_attention_core_impl(
@@ -2103,21 +2128,31 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         # (Ulysses) and/or ring-rotates KV across ring ranks; everything
         # else, including the final layer, is row-local. Only the narrow
         # video/audio logits are gathered after the final layer.
-        for index, block in enumerate(self.blocks):
-            hidden = block(
-                hidden,
-                adaln_input=adaln_input,
-                combined_indices=block_combined,
-                rope_cache=rope_cache,
-                cu_seqlens=cu_seqlens,
-                cu_seqlens_host=cu_seqlens_host,
-                max_seqlen=max_seqlen,
-                ulysses_active=ulysses_ws > 1,
-                ring_active=ring_ws > 1,
-                adaln_params=(
-                    None if block_adaln_params is None else block_adaln_params[index]
-                ),
-            )
+        # Per-row modality tags for backends that must keep some modality at
+        # full attention -- sparge_attn protects audio and text, whose rows are
+        # far outnumbered by video and so lose every block-sparse budget
+        # contest. A no-op for every other backend. Rank-local, which is the row
+        # space attention sees unless Ulysses restores the full sequence inside
+        # it; the backend length-checks these against its own query and falls
+        # back to dense when they do not line up.
+        with _row_modality_tags_ctx(block_token_tags):
+            for index, block in enumerate(self.blocks):
+                hidden = block(
+                    hidden,
+                    adaln_input=adaln_input,
+                    combined_indices=block_combined,
+                    rope_cache=rope_cache,
+                    cu_seqlens=cu_seqlens,
+                    cu_seqlens_host=cu_seqlens_host,
+                    max_seqlen=max_seqlen,
+                    ulysses_active=ulysses_ws > 1,
+                    ring_active=ring_ws > 1,
+                    adaln_params=(
+                        None
+                        if block_adaln_params is None
+                        else block_adaln_params[index]
+                    ),
+                )
         video_logits, audio_logits = self.final_layer(
             hidden,
             adaln_input=adaln_input,

@@ -360,6 +360,41 @@ class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
         return AttentionBackendEnum.FA
 
 
+class _SpargeAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SPARGE_ATTN
+
+    # SpargeAttn builds only for the arch it was compiled against. The Python
+    # dispatch in spas_sage_attn/core.py covers sm80/86/87 (fp16 pv), sm90
+    # (dedicated wgmma kernel) and everything else through the sm89 fp8 path --
+    # which is what sm120 (RTX 50xx) runs, the same way SageAttention does it.
+    required_min_capability = (8, 0)
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        major, minor = cls.required_min_capability
+        capability = platform.get_device_capability()
+        if capability is None or capability.to_int() < major * 10 + minor:
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                f"Sparge attention needs compute capability >= {major}.{minor}; "
+                f"this device reports {found}."
+            )
+        try:
+            import spas_sage_attn  # noqa: F401
+
+            from sglang.multimodal_gen.runtime.layers.attention.backends.sparge_attn import (  # noqa: F401
+                SpargeAttentionBackend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sparge_attn.SpargeAttentionBackend"
+        except ImportError as e:
+            raise ImportError(
+                "Sparge attention backend is not installed. Build SpargeAttn "
+                "for this GPU: `pip install git+https://github.com/thu-ml/SpargeAttn.git "
+                "--no-build-isolation`."
+            ) from e
+
+
 _CUDA_ATTENTION_BACKEND_RESOLVERS = {
     resolver.backend: resolver
     for resolver in (
@@ -377,6 +412,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SolAttnBackendResolver,
         _VMOBAAttentionBackendResolver,
         _SubBlockSparseAttentionBackendResolver,
+        _SpargeAttentionBackendResolver,
         _FlashAttention2BackendResolver,
         _FlashAttentionBackendResolver,
     )
