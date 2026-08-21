@@ -106,6 +106,37 @@ DEFAULT_CDFTHRESHD = None
 # integration in this tree pins it to 1e6 (disabled) instead.
 DEFAULT_PVTHRESHD = 50
 
+# How many heads the sparse path runs at a time.
+#
+# Sparsity is not free in memory: every transient scales with the head count
+# times the sequence length, and this backend is wanted precisely where that
+# product is largest. The map helper makes two [1, H, S, D] contiguous copies
+# of Q and K and hands back int8 copies on top, and
+# `block_sparse_sage2_attn_cuda` then makes its own contiguous Q/K/V, quantizes
+# Q/K again and allocates the output. At 28 rank-local heads and a 145k-row
+# packed sequence that comes to 6.6 GiB against 3.4 GiB for the dense
+# `sage_attn` fallback -- the sparse backend cost 3.2 GiB/GPU more than the
+# path it replaces, which on a 32 GiB card is several reference videos' worth
+# of budget.
+#
+# Attention is head-parallel and so is the block map -- pooling, the similarity
+# gates, the pooled-score softmax, the sort and `fill_block_map_triton` all
+# carry the head axis through untouched -- so running a slice of heads at a
+# time and concatenating is exact, not an approximation. Measured on one RTX
+# 5090 at H=28, D=128, bf16, with text rows protected, against the whole-head
+# path (identical output tensors, `torch.equal`):
+#
+#     S=86k   3.86 -> 1.29 GiB   1.08x time
+#     S=137k  6.23 -> 2.07 GiB   1.05x time
+#     S=145k  6.62 -> 2.19 GiB   1.06x time
+#
+# That is 67% off the peak and lands it *below* the dense fallback, so enabling
+# sparsity no longer raises the memory ceiling at all. The time cost is real
+# but small against what sparsity buys at these lengths (S=145k: 315 ms sliced,
+# 298 ms whole, 525 ms dense). Slices narrower than 4 start paying for the
+# extra launches without helping much further. 0 runs every head in one call.
+DEFAULT_HEAD_CHUNK = 4
+
 # Token tags that must keep full attention, as MiniMax-H3 numbers them in
 # ``minimax_h3/packed_sequence.py``: 0 VIDEO, 1 TEXT, 2 AUDIO, -1 PADDING
 # (clamped to 0 in the rank-local copy). Audio is protected by default.
@@ -241,6 +272,7 @@ class SpargeSchedule(msgspec.Struct, frozen=True):
     simthreshd1: float
     pvthreshd: int
     dense_modalities: tuple[int, ...]
+    head_chunk: int
 
     @classmethod
     def from_server_args(cls) -> "SpargeSchedule":
@@ -267,6 +299,9 @@ class SpargeSchedule(msgspec.Struct, frozen=True):
                 int(tag)
                 for tag in config.get("dense_modalities", DEFAULT_DENSE_MODALITIES)
             ),
+            head_chunk=int(
+                config.get("head_chunk", DEFAULT_HEAD_CHUNK)
+            ),
         )
         if (schedule.topk is None) == (schedule.cdfthreshd is None):
             raise ValueError(
@@ -288,6 +323,11 @@ class SpargeSchedule(msgspec.Struct, frozen=True):
             # The kernel itself asserts seq_len >= 128.
             raise ValueError(
                 f"sparge min_seq_len must be at least 128, got {schedule.min_seq_len}"
+            )
+        if schedule.head_chunk < 0:
+            raise ValueError(
+                "sparge head_chunk must be non-negative (0 runs every head in "
+                f"one call), got {schedule.head_chunk}"
             )
         return schedule
 
@@ -464,6 +504,65 @@ class SpargeAttentionImpl(AttentionImpl):
         padded[: protected.shape[0]] = protected
         return padded.view(count, block).any(dim=1)
 
+    def _head_slices(self, *tensors: torch.Tensor):
+        """Yield ``head_chunk``-wide head slices of ``[1, S, H, D]`` tensors.
+
+        Attention is head-parallel and so is the block map, so running the
+        whole sparse path a slice at a time is exact -- see
+        ``DEFAULT_HEAD_CHUNK`` for why it is worth doing. Slices are made
+        contiguous here because both the map helper and the kernel copy their
+        inputs anyway; doing it per slice is what keeps the copies small.
+        A chunk that covers every head yields the originals untouched, so the
+        unsliced path costs nothing.
+        """
+        heads = tensors[0].shape[-2]
+        chunk = self.schedule.head_chunk
+        if chunk <= 0 or chunk >= heads:
+            yield tensors
+            return
+        for head in range(0, heads, chunk):
+            yield tuple(
+                t[:, :, head : head + chunk].contiguous() for t in tensors
+            )
+
+    def _block_map(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        *,
+        blk_q: int,
+        blk_k: int,
+    ) -> torch.Tensor:
+        """Pooled-Q.K block map for one head slice of ``[1, S, H, D]``.
+
+        The helper's own int8/scale returns are dropped as soon as it returns
+        -- ``block_sparse_sage2_attn_cuda`` re-quantizes from the untouched NHD
+        Q/K anyway, so holding them only widens the peak.
+        """
+        from spas_sage_attn.utils import get_block_map_meansim_fuse_quant
+
+        # The map is computed in HND, the layout SpargeAttn's own API converts
+        # to before doing the same thing.
+        q_hnd = q.transpose(1, 2).contiguous()
+        k_hnd = k.transpose(1, 2).contiguous()
+        km = k_hnd.mean(dim=-2, keepdim=True)
+        block_map, *quantized = get_block_map_meansim_fuse_quant(
+            q_hnd,
+            k_hnd,
+            km,
+            is_causal=False,
+            BLKQ=blk_q,
+            BLKK=blk_k,
+            simthreshd1=self.schedule.simthreshd1,
+            cdfthreshd=self.schedule.cdfthreshd,
+            topk=self.schedule.topk,
+            return_lut=False,
+        )
+        # Named rather than `*_` so the int8/scale copies can actually be
+        # dropped here instead of living until this frame returns.
+        del quantized, q_hnd, k_hnd, km
+        return block_map
+
     def _sparse_attention(
         self,
         q: torch.Tensor,
@@ -484,6 +583,15 @@ class SpargeAttentionImpl(AttentionImpl):
         ):
             from spas_sage_attn import spas_sage2_attn_meansim_topk_cuda
 
+            # SpargeAttn's own entry point, so `head_chunk` does not
+            # reach the [1, H, S, D] copies it makes internally. Left alone
+            # because it asks for the map with `return_lut=True` and feeds the
+            # quantized Q/K straight to the kernel; routing it through
+            # `_block_map` would bound the transients but add back the
+            # quantization pass `block_sparse_sage2_attn_cuda` performs. Any
+            # H3 run that protects a modality -- the default -- takes the
+            # explicit path below instead.
+            #
             # Proof that the sparse path actually ran, with the shape it ran
             # on -- the construction-time log only says the layer was eligible.
             logger.info_once(
@@ -504,31 +612,17 @@ class SpargeAttentionImpl(AttentionImpl):
 
         from spas_sage_attn import block_sparse_sage2_attn_cuda
         from spas_sage_attn.core import get_cuda_arch_versions
-        from spas_sage_attn.utils import get_block_map_meansim_fuse_quant
 
         # Same block geometry the kernel is compiled for; sm90 transposes it.
         arch = get_cuda_arch_versions()[q.device.index]
         blk_q, blk_k = (64, 128) if arch == "sm90" else (128, 64)
 
-        # The map is computed in HND, the layout SpargeAttn's own API converts
-        # to before doing the same thing.
-        q_hnd = q.transpose(1, 2).contiguous()
-        k_hnd = k.transpose(1, 2).contiguous()
-        km = k_hnd.mean(dim=-2, keepdim=True)
-        block_map, *_ = get_block_map_meansim_fuse_quant(
-            q_hnd,
-            k_hnd,
-            km,
-            is_causal=False,
-            BLKQ=blk_q,
-            BLKK=blk_k,
-            simthreshd1=self.schedule.simthreshd1,
-            cdfthreshd=self.schedule.cdfthreshd,
-            topk=self.schedule.topk,
-            return_lut=False,
-        )
+        seq = q.shape[1]
+        n_q = (seq + blk_q - 1) // blk_q
+        n_k = (seq + blk_k - 1) // blk_k
 
-        n_q, n_k = block_map.shape[-2], block_map.shape[-1]
+        # Head-independent, so it is worked out once and reused by every slice.
+        protected_q = protected_k = None
         # `protected` is None whenever protection is switched off; this path is
         # also how cdfthreshd runs, which the plug-and-play API cannot express.
         if protected is None:
@@ -539,9 +633,6 @@ class SpargeAttentionImpl(AttentionImpl):
         else:
             protected_q = self._blocks_touching(protected, blk_q, n_q)
             protected_k = self._blocks_touching(protected, blk_k, n_k)
-            # Protected rows keep every key; protected keys are kept by every row.
-            block_map[..., protected_q, :] = True
-            block_map[..., :, protected_k] = True
             logger.info_once(
                 f"Sparge attention active: S={k.shape[1]} heads={q.shape[2]} "
                 f"{self._selection_rule()}, keeping "
@@ -549,15 +640,31 @@ class SpargeAttentionImpl(AttentionImpl):
                 f"{int(protected_k.sum())}/{n_k} key blocks dense for modalities "
                 f"{list(self.schedule.dense_modalities)}"
             )
-        return block_sparse_sage2_attn_cuda(
-            q,
-            k,
-            v,
-            mask_id=block_map,
-            pvthreshd=self.schedule.pvthreshd,
-            scale=self.softmax_scale,
-            tensor_layout="NHD",
-        )
+
+        outputs = []
+        for q_s, k_s, v_s in self._head_slices(q, k, v):
+            block_map = self._block_map(q_s, k_s, blk_q=blk_q, blk_k=blk_k)
+            if protected_q is not None:
+                # Protected rows keep every key; protected keys are kept by
+                # every row.
+                block_map[..., protected_q, :] = True
+                block_map[..., :, protected_k] = True
+            outputs.append(
+                block_sparse_sage2_attn_cuda(
+                    q_s,
+                    k_s,
+                    v_s,
+                    mask_id=block_map,
+                    pvthreshd=self.schedule.pvthreshd,
+                    scale=self.softmax_scale,
+                    tensor_layout="NHD",
+                )
+            )
+            # Let this slice's transients go before the next one allocates.
+            del q_s, k_s, v_s, block_map
+        if len(outputs) == 1:
+            return outputs[0]
+        return torch.cat(outputs, dim=-2)
 
     def forward(
         self,

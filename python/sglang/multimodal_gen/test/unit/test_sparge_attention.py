@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.sparge_attn import (
+    DEFAULT_HEAD_CHUNK,
     SpargeAttentionBackend,
     SpargeAttentionImpl,
     SpargeSchedule,
@@ -505,3 +506,117 @@ class TestDenseModalitiesConfig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHeadChunking(unittest.TestCase):
+    """Running the sparse path a head slice at a time must change nothing.
+
+    Both halves of the path are head-parallel: attention itself, and every
+    step of SpargeAttn's map helper (pooling, the similarity gates, the
+    pooled-score softmax, the sort and `fill_block_map_triton`). If a future
+    SpargeAttn ever mixes heads -- a shared budget, a cross-head normalization
+    -- this test is what catches it, because the sliced result would stop
+    matching the whole-head one.
+    """
+
+    def test_chunk_size_is_validated(self):
+        with patch(_SERVER_ARGS, return_value=_FakeServerArgs({})):
+            self.assertEqual(
+                SpargeSchedule.from_server_args().head_chunk, DEFAULT_HEAD_CHUNK
+            )
+        with patch(_SERVER_ARGS, return_value=_FakeServerArgs({"head_chunk": 0})):
+            self.assertEqual(SpargeSchedule.from_server_args().head_chunk, 0)
+        with patch(_SERVER_ARGS, return_value=_FakeServerArgs({"head_chunk": -1})):
+            with self.assertRaisesRegex(ValueError, "head_chunk"):
+                SpargeSchedule.from_server_args()
+
+    @staticmethod
+    def _qkv(heads, seq):
+        torch.manual_seed(0)
+        shape = (1, seq, heads, HEAD_DIM)
+        return tuple(
+            torch.randn(*shape, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+        )
+
+    @requires_sparge
+    def test_block_map_is_bit_identical_across_chunk_sizes(self):
+        heads, seq = 8, 4096
+        q, k, _ = self._qkv(heads, seq)
+
+        def whole_map():
+            impl = _make_impl({"topk": 0.5, "head_chunk": 0})
+            return impl._block_map(q, k, blk_q=128, blk_k=64)
+
+        def sliced_maps(chunk):
+            impl = _make_impl({"topk": 0.5, "head_chunk": chunk})
+            return torch.cat(
+                [
+                    impl._block_map(q_s, k_s, blk_q=128, blk_k=64)
+                    for q_s, k_s in impl._head_slices(q, k)
+                ],
+                dim=1,
+            )
+
+        whole = whole_map()
+        self.assertEqual(whole.shape[1], heads)
+        # Every divisor plus a size that does not divide the head count, so the
+        # ragged last slice is covered too.
+        for chunk in (1, 2, 3, 4, 8, 16):
+            with self.subTest(chunk=chunk):
+                sliced = sliced_maps(chunk)
+                self.assertEqual(sliced.shape, whole.shape)
+                self.assertTrue(
+                    torch.equal(whole, sliced),
+                    f"chunk={chunk} changed {int((whole ^ sliced).sum())} blocks",
+                )
+
+    @requires_sparge
+    def test_sparse_attention_is_bit_identical_across_chunk_sizes(self):
+        heads, seq = 8, 4096
+        q, k, v = self._qkv(heads, seq)
+        # Protection on, which is the path any H3 run with default
+        # dense_modalities takes.
+        protected = torch.zeros(seq, dtype=torch.bool, device="cuda")
+        protected[:256] = True
+
+        def attend(chunk):
+            impl = _make_impl({"topk": 0.5, "head_chunk": chunk})
+            return impl._sparse_attention(q, k, v, protected)
+
+        whole = attend(0)
+        for chunk in (1, 3, 4, 8, 16):
+            with self.subTest(chunk=chunk):
+                sliced = attend(chunk)
+                self.assertEqual(sliced.shape, whole.shape)
+                self.assertTrue(
+                    torch.equal(whole, sliced),
+                    f"chunk={chunk} max |diff| "
+                    f"{(whole.float() - sliced.float()).abs().max().item():.3e}",
+                )
+
+    @requires_sparge
+    def test_chunking_lowers_the_transient_peak(self):
+        """The point of the split: the peak scales with the slice, not H."""
+        heads, seq = 16, 8192
+        q, k, v = self._qkv(heads, seq)
+        protected = torch.zeros(seq, dtype=torch.bool, device="cuda")
+        protected[:256] = True
+
+        def peak_at(chunk):
+            impl = _make_impl({"topk": 0.5, "head_chunk": chunk})
+            impl._sparse_attention(q, k, v, protected)  # warm the Triton cache
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            before = torch.cuda.memory_allocated()
+            impl._sparse_attention(q, k, v, protected)
+            torch.cuda.synchronize()
+            return torch.cuda.max_memory_allocated() - before
+
+        whole = peak_at(0)
+        sliced = peak_at(2)
+        self.assertLess(
+            sliced,
+            whole / 2,
+            "expected the split to more than halve the peak, got "
+            f"{sliced / 2**20:.0f} MiB against {whole / 2**20:.0f} MiB",
+        )
