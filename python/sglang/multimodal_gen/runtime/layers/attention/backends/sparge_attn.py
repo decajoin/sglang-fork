@@ -14,8 +14,10 @@ declines to sparsify still gets SageAttention's quantization speedup.
 
 Sparsity is not applied everywhere. The early denoise steps settle the layout of
 the sample and tolerate approximation badly, so the backend runs dense for them;
-short sequences run dense because the block map costs more than the blocks it
-saves. Both cutoffs are configured through ``--attention-backend-config``::
+an optional tail cutoff does the same for the last few steps, whose errors no
+later step can absorb; short sequences run dense because the block map costs
+more than the blocks it saves. The cutoffs are configured through
+``--attention-backend-config``::
 
     --attention-backend sparge_attn \
     --component-attention-backends text_encoder=fa \
@@ -81,6 +83,28 @@ DEFAULT_TOPK = 0.5
 # not been re-swept for this backend's block map -- treat 10 as a starting
 # point, not a measured optimum for SpargeAttn.
 DEFAULT_SKIP_FIRST_STEPS = 10
+# Trailing denoise forwards kept dense. Off by default: unlike the warmup
+# cutoff this one has not been measured on this model, and the two arguments
+# for it point in opposite directions.
+#
+# For it: denoising is self-correcting in the middle but not at the ends. An
+# error injected at step t perturbs the latent, and steps t+1..T re-denoise
+# from the perturbed latent and land on something plausible -- the error is
+# absorbed as "a slightly different but coherent sample". The last step has no
+# successor, so whatever the block map gets wrong there reaches the decoder
+# unfiltered. Truncation is at 128x64 token granularity, which in a packed
+# video sequence is a contiguous run of patches, so that error is spatially
+# block-structured, which is the visual signature of the artifacts this knob
+# exists to test for.
+#
+# Against it: late-step attention is typically more concentrated than
+# early-step attention, so a fixed top-k budget drops less probability mass
+# there. That is why SpargeAttn's own experiments, and every other sparse
+# schedule in this tree, protect the warmup steps and nothing else.
+#
+# Two steps out of fifty is ~4% of the schedule, cheap enough to keep if it
+# measures well. Measure against the dense render before raising this default.
+DEFAULT_SKIP_LAST_STEPS = 0
 # Depth does not behave like step index: subblock_sparse measured the layer
 # cutoff as worth ~1% of time for 0.0013 of cosine, inside its noise floor.
 DEFAULT_SKIP_FIRST_LAYERS = 0
@@ -187,6 +211,40 @@ def sparge_row_modality_tags(tags: torch.Tensor | None) -> Iterator[None]:
         _row_modality_tags.reset(token)
 
 
+# Length of the denoise schedule the current run is stepping through, published
+# by the stage that owns the loop. Only ``skip_last_steps`` needs it.
+_denoise_total_steps: ContextVar[int | None] = ContextVar(
+    "sparge_denoise_total_steps", default=None
+)
+
+
+@contextmanager
+def sparge_denoise_total_steps(total: int | None) -> Iterator[None]:
+    """Publish how many denoise steps the loop about to run will take.
+
+    ``skip_last_steps`` cannot be applied without this. ``current_timestep`` is
+    a zero-based counter with no upper bound attached to it, so on its own it
+    cannot say which forward is the last one.
+
+    The caller must be whoever owns the sigma schedule, because that is the
+    only place the count is authoritative.
+    ``sampling_params.num_inference_steps`` is a request-level *hint*: for
+    MiniMax-H3 it may be a ``(video, audio)`` pair rather than an int, and the
+    loop actually runs ``len(sigmas_video) - 1``. Reading the hint instead
+    would leave the tail cutoff silently inactive on exactly the model this
+    backend targets, which is worse than not having it -- an experiment that
+    never ran looks like an experiment that came back negative.
+
+    A no-op for every backend other than this one, and for this one unless
+    ``skip_last_steps`` is set.
+    """
+    token = _denoise_total_steps.set(total)
+    try:
+        yield
+    finally:
+        _denoise_total_steps.reset(token)
+
+
 # ``blocks.<idx>.attn`` is a DiT layer; ``token_refiner.blocks.<idx>.attn`` and
 # anything else is not and stays dense.
 _DIT_LAYER_PREFIX = re.compile(r"^blocks\.(\d+)\.")
@@ -267,6 +325,7 @@ class SpargeSchedule(msgspec.Struct, frozen=True):
     topk: float | None
     cdfthreshd: float | None
     skip_first_steps: int
+    skip_last_steps: int
     skip_first_layers: int
     min_seq_len: int
     simthreshd1: float
@@ -288,6 +347,9 @@ class SpargeSchedule(msgspec.Struct, frozen=True):
             cdfthreshd=(None if _cdf is None else float(_cdf)),
             skip_first_steps=int(
                 config.get("skip_first_steps", DEFAULT_SKIP_FIRST_STEPS)
+            ),
+            skip_last_steps=int(
+                config.get("skip_last_steps", DEFAULT_SKIP_LAST_STEPS)
             ),
             skip_first_layers=int(
                 config.get("skip_first_layers", DEFAULT_SKIP_FIRST_LAYERS)
@@ -317,8 +379,12 @@ class SpargeSchedule(msgspec.Struct, frozen=True):
             raise ValueError(
                 f"sparge cdfthreshd must be in (0, 1], got {schedule.cdfthreshd}"
             )
-        if schedule.skip_first_steps < 0 or schedule.skip_first_layers < 0:
-            raise ValueError("sparge skip_first_* must be non-negative")
+        if (
+            schedule.skip_first_steps < 0
+            or schedule.skip_last_steps < 0
+            or schedule.skip_first_layers < 0
+        ):
+            raise ValueError("sparge skip_first_*/skip_last_* must be non-negative")
         if schedule.min_seq_len < 128:
             # The kernel itself asserts seq_len >= 128.
             raise ValueError(
@@ -376,12 +442,17 @@ class SpargeAttentionImpl(AttentionImpl):
         )
         self.dense_impl = self._build_dense_impl(causal=causal)
         if self.layer_enabled:
+            tail = (
+                f", the last {self.schedule.skip_last_steps} denoise steps"
+                if self.schedule.skip_last_steps
+                else ""
+            )
             logger.info_once(
                 f"Sparge attention: {self._selection_rule()} "
                 f"pvthreshd={self.schedule.pvthreshd}, dense for the first "
-                f"{self.schedule.skip_first_steps} denoise steps, the first "
-                f"{self.schedule.skip_first_layers} DiT layers, and sequences "
-                f"under {self.schedule.min_seq_len} tokens"
+                f"{self.schedule.skip_first_steps} denoise steps{tail}, the "
+                f"first {self.schedule.skip_first_layers} DiT layers, and "
+                f"sequences under {self.schedule.min_seq_len} tokens"
             )
 
     def _build_dense_impl(self, *, causal: bool) -> AttentionImpl:
@@ -418,31 +489,87 @@ class SpargeAttentionImpl(AttentionImpl):
         )
 
     def _step_enabled(self) -> bool:
-        context = get_forward_context()
-        self._warn_if_schedule_is_shorter_than_the_cutoff(context)
-        return context.current_timestep >= self.schedule.skip_first_steps
+        """Whether this denoise step may sparsify, by index within the schedule.
 
-    def _warn_if_schedule_is_shorter_than_the_cutoff(self, context) -> None:
-        """A distilled checkpoint can be shorter than ``skip_first_steps``.
-
-        The default cutoff of 10 assumes the 50-step schedule. Turbo LoRAs run
-        ``num_inference_steps`` of 9 or 5, where every step index is below the
-        cutoff and this backend silently degrades into plain SageAttention.
-        That is a config mistake worth a line in the log rather than an
-        unexplained absence of speedup.
+        Both cutoffs fall back the same way: returning False here sends the
+        call through ``dense_impl``, which is the unmodified ``sage_attn``
+        backend, so an excluded step costs exactly what a plain
+        ``--attention-backend sage_attn`` deployment costs.
         """
+        context = get_forward_context()
+        step = context.current_timestep
+        total = self._total_steps(context)
+        self._warn_if_the_cutoffs_swallow_the_schedule(total)
+        if step < self.schedule.skip_first_steps:
+            return False
+        if self.schedule.skip_last_steps <= 0:
+            return True
+        if total is None:
+            self._warn_tail_cutoff_has_no_schedule_length()
+            return True
+        return step < total - self.schedule.skip_last_steps
+
+    @staticmethod
+    def _total_steps(context) -> int | None:
+        """Length of the running denoise schedule, or None if nothing said.
+
+        The published value wins: it comes from the stage that owns the sigma
+        schedule and is what the loop actually iterates.
+        ``num_inference_steps`` is the request-level hint and only usable when
+        it really is a positive int -- MiniMax-H3 types it as
+        ``int | tuple[int, int]``, and a pair carries no single loop length.
+        """
+        published = _denoise_total_steps.get()
+        if isinstance(published, int) and published > 0:
+            return published
         batch = getattr(context, "forward_batch", None)
-        total = getattr(
+        hint = getattr(
             getattr(batch, "sampling_params", None), "num_inference_steps", None
         )
-        if isinstance(total, int) and total <= self.schedule.skip_first_steps:
-            logger.warning_once(
-                f"Sparge attention never activates: skip_first_steps="
-                f"{self.schedule.skip_first_steps} but this request runs only "
-                f"{total} denoise steps, so every step takes the dense path. "
-                f"Lower skip_first_steps (roughly 20% of the schedule, so ~2 "
-                f"for a 9-step turbo checkpoint) via --attention-backend-config."
-            )
+        if isinstance(hint, int) and not isinstance(hint, bool) and hint > 0:
+            return hint
+        return None
+
+    def _warn_if_the_cutoffs_swallow_the_schedule(self, total: int | None) -> None:
+        """The two step cutoffs together can leave no sparse step at all.
+
+        The default warmup cutoff of 10 assumes the 50-step schedule. Turbo
+        LoRAs run 9 or 5 steps, where every index is below the cutoff and this
+        backend silently degrades into plain SageAttention. Adding a tail
+        cutoff makes the same mistake reachable from the other end. Either way
+        it is a config error worth a line in the log rather than an unexplained
+        absence of speedup.
+        """
+        if total is None:
+            return
+        dense = self.schedule.skip_first_steps + self.schedule.skip_last_steps
+        if dense < total:
+            return
+        logger.warning_once(
+            f"Sparge attention never activates: skip_first_steps="
+            f"{self.schedule.skip_first_steps} + skip_last_steps="
+            f"{self.schedule.skip_last_steps} covers all {total} denoise steps "
+            f"this request runs, so every step takes the dense path. Lower them "
+            f"(warmup is roughly 20% of the schedule, so ~2 for a 9-step turbo "
+            f"checkpoint) via --attention-backend-config."
+        )
+
+    def _warn_tail_cutoff_has_no_schedule_length(self) -> None:
+        """``skip_last_steps`` set but nobody published the schedule length.
+
+        Fail open rather than closed: without a length the last step cannot be
+        identified, and running every step dense would disable the backend
+        wholesale over a missing integer. Sparsifying the tail is the smaller
+        error, but it must be loud -- a silently inactive cutoff would read as
+        evidence that the tail is not the problem.
+        """
+        logger.warning_once(
+            f"Sparge attention skip_last_steps={self.schedule.skip_last_steps} "
+            "is inactive: no denoise schedule length was published, so the "
+            "last step cannot be identified and every step stays sparse. The "
+            "pipeline stage owning the loop must wrap it in "
+            "sparge_denoise_total_steps()."
+        )
 
     def _sparse_ready(self, q: torch.Tensor, k: torch.Tensor) -> bool:
         """``q``/``k`` are ``[B, S, H, D]`` or ``[1, S, H, D]`` NHD slices."""
@@ -771,4 +898,6 @@ __all__ = [
     "SpargeAttentionMetadata",
     "SpargeAttentionMetadataBuilder",
     "SpargeSchedule",
+    "sparge_denoise_total_steps",
+    "sparge_row_modality_tags",
 ]

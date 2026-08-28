@@ -27,8 +27,20 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.sparge_attn import 
     SpargeSchedule,
     _dit_layer_index,
     _trailing_padding_used_len,
+    sparge_denoise_total_steps,
     sparge_row_modality_tags,
 )
+
+
+def _forget_once_warnings() -> None:
+    """``warning_once`` is lru_cached on (logger, message).
+
+    Without this a warning asserted by one test is silently absent in the
+    next, which would make these tests order-dependent.
+    """
+    from sglang.multimodal_gen.runtime.utils import logging_utils
+
+    logging_utils._print_warning_once.cache_clear()
 
 # MiniMax-H3 token tags, from minimax_h3/packed_sequence.py.
 VIDEO_TAG, TEXT_TAG, AUDIO_TAG = 0, 1, 2
@@ -117,6 +129,8 @@ class TestSpargeSchedule(unittest.TestCase):
             schedule = SpargeSchedule.from_server_args()
         self.assertEqual(schedule.topk, 0.5)
         self.assertEqual(schedule.skip_first_steps, 10)
+        # The tail cutoff is unmeasured on this model, so it ships off.
+        self.assertEqual(schedule.skip_last_steps, 0)
         self.assertEqual(schedule.skip_first_layers, 0)
         self.assertEqual(schedule.min_seq_len, 4096)
 
@@ -130,6 +144,7 @@ class TestSpargeSchedule(unittest.TestCase):
             {"topk": 0.0},
             {"topk": 1.5},
             {"skip_first_steps": -1},
+            {"skip_last_steps": -1},
             {"skip_first_layers": -1},
             # The kernel itself asserts seq_len >= 128.
             {"min_seq_len": 64},
@@ -209,6 +224,9 @@ class TestSpargeGating(unittest.TestCase):
 class TestShortScheduleWarning(unittest.TestCase):
     """A turbo checkpoint runs 9 or 5 steps; the default cutoff is 10."""
 
+    def setUp(self):
+        _forget_once_warnings()
+
     def test_warns_when_every_step_is_below_the_cutoff(self):
         impl = _make_impl({"skip_first_steps": 10})
         with _at_step(3, num_inference_steps=9):
@@ -216,10 +234,19 @@ class TestShortScheduleWarning(unittest.TestCase):
                 self.assertFalse(impl._step_enabled())
         self.assertIn("never activates", "".join(logs.output))
 
+    def test_warns_when_the_two_cutoffs_together_cover_the_schedule(self):
+        """Neither cutoff is too big alone; together they leave nothing."""
+        impl = _make_impl({"skip_first_steps": 5, "skip_last_steps": 5})
+        with sparge_denoise_total_steps(9):
+            with _at_step(6):
+                with self.assertLogs(level="WARNING") as logs:
+                    self.assertFalse(impl._step_enabled())
+        self.assertIn("never activates", "".join(logs.output))
+
     def test_silent_when_the_schedule_is_long_enough(self):
         impl = _make_impl({"skip_first_steps": 2})
         with _at_step(3, num_inference_steps=9):
-            with patch.object(impl, "_warn_if_schedule_is_shorter_than_the_cutoff") as w:
+            with patch.object(impl, "_warn_if_the_cutoffs_swallow_the_schedule") as w:
                 self.assertTrue(impl._step_enabled())
                 w.assert_called_once()
         # and the real check stays quiet for this combination
@@ -231,6 +258,60 @@ class TestShortScheduleWarning(unittest.TestCase):
         impl = _make_impl({"skip_first_steps": 10})
         with _at_step(3):  # forward_batch is None, as in text encoding
             self.assertFalse(impl._step_enabled())
+
+
+@requires_sparge
+class TestTailCutoff(unittest.TestCase):
+    """``skip_last_steps`` routes the final forwards back through sage_attn."""
+
+    def setUp(self):
+        _forget_once_warnings()
+
+    def test_last_steps_are_excluded(self):
+        impl = _make_impl({"skip_first_steps": 0, "skip_last_steps": 2})
+        with sparge_denoise_total_steps(10):
+            for step, expected in ((0, True), (7, True), (8, False), (9, False)):
+                with self.subTest(step=step):
+                    with _at_step(step):
+                        self.assertEqual(impl._step_enabled(), expected)
+
+    def test_both_cutoffs_apply_together(self):
+        impl = _make_impl({"skip_first_steps": 2, "skip_last_steps": 2})
+        with sparge_denoise_total_steps(10):
+            for step, expected in ((1, False), (2, True), (7, True), (8, False)):
+                with self.subTest(step=step):
+                    with _at_step(step):
+                        self.assertEqual(impl._step_enabled(), expected)
+
+    def test_published_length_beats_the_sampling_params_hint(self):
+        """H3 runs len(sigmas_video)-1, which need not equal the hint."""
+        impl = _make_impl({"skip_first_steps": 0, "skip_last_steps": 1})
+        with sparge_denoise_total_steps(10):
+            with _at_step(9, num_inference_steps=50):
+                self.assertFalse(impl._step_enabled())
+
+    def test_a_tuple_valued_hint_is_not_a_schedule_length(self):
+        """MiniMax-H3 types num_inference_steps as ``int | tuple[int, int]``."""
+        impl = _make_impl({"skip_first_steps": 0, "skip_last_steps": 1})
+        with _at_step(9, num_inference_steps=(10, 10)):
+            with self.assertLogs(level="WARNING") as logs:
+                self.assertTrue(impl._step_enabled())
+        self.assertIn("no denoise schedule length", "".join(logs.output))
+
+    def test_missing_length_fails_open_and_says_so(self):
+        """Losing the tail beats disabling the backend over a missing int."""
+        impl = _make_impl({"skip_first_steps": 0, "skip_last_steps": 2})
+        with _at_step(5):
+            with self.assertLogs(level="WARNING") as logs:
+                self.assertTrue(impl._step_enabled())
+        self.assertIn("skip_last_steps=2 is inactive", "".join(logs.output))
+
+    def test_the_default_schedule_never_asks_for_a_length(self):
+        impl = _make_impl({"skip_first_steps": 0})
+        with _at_step(5):
+            with patch.object(impl, "_warn_tail_cutoff_has_no_schedule_length") as w:
+                self.assertTrue(impl._step_enabled())
+                w.assert_not_called()
 
 
 @requires_sparge
@@ -268,6 +349,23 @@ class TestSpargeNumerics(unittest.TestCase):
             self.assertTrue(torch.equal(impl.forward(*self.qkv, None), dense))
         with _at_step(20):
             self.assertFalse(torch.equal(impl.forward(*self.qkv, None), dense))
+
+    def test_last_steps_take_the_dense_path_exactly(self):
+        """The tail cutoff must land on sage_attn, bit for bit."""
+        impl = _make_impl(
+            {
+                "topk": 0.3,
+                "skip_first_steps": 0,
+                "skip_last_steps": 2,
+                "dense_modalities": [],
+            }
+        )
+        dense = impl.dense_impl.forward(*self.qkv, None)
+        with sparge_denoise_total_steps(10):
+            with _at_step(7):
+                self.assertFalse(torch.equal(impl.forward(*self.qkv, None), dense))
+            with _at_step(8):
+                self.assertTrue(torch.equal(impl.forward(*self.qkv, None), dense))
 
     def test_short_sequences_take_the_dense_path_exactly(self):
         short = tuple(t[:, :2048] for t in self.qkv)

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import contextmanager
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any
 
 import torch
@@ -46,6 +46,31 @@ _REF2VA_VIDEO_CHAINS = {
     "video.reference_preserve",
     "video_audio.reference_preserve",
 }
+
+
+@lru_cache(maxsize=1)
+def _denoise_total_steps_publisher():
+    """Resolve the sparge_attn schedule-length publisher, or a no-op.
+
+    Only sparge_attn's ``skip_last_steps`` consumes the schedule length.
+    Resolving it lazily and degrading to ``nullcontext`` keeps every other
+    backend on exactly the path it had before, and mirrors how the model
+    publishes modality tags in ``minimax_h3.py``.
+    """
+    try:
+        from sglang.multimodal_gen.runtime.layers.attention.backends.sparge_attn import (
+            sparge_denoise_total_steps,
+        )
+
+        return sparge_denoise_total_steps
+    except Exception:  # pragma: no cover - defensive
+        import contextlib
+
+        return lambda _total: contextlib.nullcontext()
+
+
+def _denoise_total_steps_ctx(total: int):
+    return _denoise_total_steps_publisher()(total)
 
 
 def minimax_h3_condition_noise_aug(sampling: Any) -> tuple[float, float]:
@@ -653,6 +678,10 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
             with (
                 maybe_nvtx_range("denoising_loop", self.current_use_nvtx),
+                # The loop runs len(sigmas_video) - 1 forwards; that count is
+                # authoritative here and nowhere else, and sparge_attn's tail
+                # cutoff cannot identify the last step without it.
+                _denoise_total_steps_ctx(len(sigmas_video) - 1),
                 self.progress_bar(
                     total=len(sigmas_video) - 1,
                     batch=batch,
