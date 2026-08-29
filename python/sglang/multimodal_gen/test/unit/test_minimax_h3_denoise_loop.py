@@ -193,3 +193,35 @@ def test_rank_local_token_tags_match_reference_slice():
                 torch.testing.assert_close(
                     branch.static_kwargs["block_token_tags"], expected, rtol=0, atol=0
                 )
+
+
+def test_full_length_tags_are_published_only_under_sequence_parallelism():
+    """Attention's row space is the whole sequence, not this rank's row shard.
+
+    Ulysses restores the shard to full length inside the attention call, so a
+    backend needing per-row tags there (sparge_attn keeps text and audio dense)
+    needs the full-length copy. Without sequence parallelism the rank-local
+    tags already are the whole sequence, so the second copy must be absent --
+    carrying one would be dead weight, and its absence is what lets the DiT
+    reuse the rank-local tensor unchanged on that path.
+    """
+    for mode in ("t2va", "fl2va", "ref2va"):
+        seq_len = _branch(mode).seq_len
+        token_tags = torch.arange(seq_len, dtype=torch.long) - seq_len // 2
+        for world_size in (1, 2, 4, 8):
+            for rank in range(world_size):
+                with patch(
+                    "sglang.multimodal_gen.runtime.pipelines_core.stages."
+                    "model_specific_stages.minimax_h3.denoise_loop.get_ulysses_ctx",
+                    return_value=(world_size, rank),
+                ):
+                    branch = _branch(mode, token_tags=token_tags)
+                if world_size == 1:
+                    assert branch.packed_token_tags is None
+                    assert "token_tags" not in branch.static_kwargs
+                    continue
+                published = branch.static_kwargs["token_tags"]
+                assert published.shape[0] == branch.seq_len
+                torch.testing.assert_close(
+                    published, token_tags.clamp(min=0), rtol=0, atol=0
+                )

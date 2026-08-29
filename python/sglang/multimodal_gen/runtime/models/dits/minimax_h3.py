@@ -472,6 +472,33 @@ def _row_modality_tags_ctx(tags):
     return _row_modality_tags_publisher()(tags)
 
 
+def _attention_row_modality_tags(
+    *,
+    sp_ws: int,
+    block_token_tags: torch.Tensor,
+    token_tags: torch.Tensor | None,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Per-row modality tags in *attention's* row space, or None if unavailable.
+
+    Attention sees the whole packed sequence on every rank: Ulysses trades
+    sequence for heads inside the call, so the row shard is restored to full
+    length before the kernel sees it. Publishing the rank-local slice there
+    would describe the wrong rows.
+
+    Without sequence parallelism the rank-local tags already are the whole
+    sequence and are returned unchanged -- the same tensor object, which is
+    what keeps that path byte-for-byte identical. With it the caller must also
+    supply the full-length copy; one that does not gets None, and the consuming
+    backend falls back to dense and logs why.
+    """
+    if sp_ws == 1:
+        return block_token_tags
+    if token_tags is None:
+        return None
+    return token_tags.to(device).clamp(min=0)
+
+
 def _minimax_h3_attention_core_impl(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -1954,7 +1981,12 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             token_tags = _required_kwarg(kwargs, "token_tags").view(-1).to(torch.long)
         else:
             block_token_tags = block_token_tags.view(-1).to(torch.long)
-            token_tags = None
+            # Both are kept when both are supplied: the rank-local slice drives
+            # the block stack, and the full-length copy is what attention's row
+            # space needs under sequence parallelism (see the tags published
+            # around the block loop below).
+            if token_tags is not None:
+                token_tags = token_tags.view(-1).to(torch.long)
         skip_mask_out_condition = bool(kwargs.get("skip_mask_out_condition", False))
 
         text_selected = _required_kwarg(kwargs, "prompt_embeds")
@@ -2131,11 +2163,16 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         # Per-row modality tags for backends that must keep some modality at
         # full attention -- sparge_attn protects audio and text, whose rows are
         # far outnumbered by video and so lose every block-sparse budget
-        # contest. A no-op for every other backend. Rank-local, which is the row
-        # space attention sees unless Ulysses restores the full sequence inside
-        # it; the backend length-checks these against its own query and falls
-        # back to dense when they do not line up.
-        with _row_modality_tags_ctx(block_token_tags):
+        # contest. A no-op for every other backend. These live in attention's
+        # row space, not the block stack's; see the helper.
+        with _row_modality_tags_ctx(
+            _attention_row_modality_tags(
+                sp_ws=sp_ws,
+                block_token_tags=block_token_tags,
+                token_tags=token_tags,
+                device=device,
+            )
+        ):
             for index, block in enumerate(self.blocks):
                 hidden = block(
                     hidden,

@@ -190,6 +190,16 @@ class MiniMaxH3DenoiseBranch:
         self.block_token_tags = (
             token_tags_host[local_row_start:local_row_stop].clamp(min=0).to(device)
         )
+        # Attention sees the whole packed sequence on every rank -- Ulysses
+        # trades sequence for heads inside it, so the row shard is restored to
+        # full length before the kernel runs. Backends that need per-row tags
+        # there (sparge_attn keeps text/audio dense) therefore need the
+        # full-length copy, not this rank's slice. Only carried when the two
+        # actually differ; without sequence parallelism block_token_tags is
+        # already the whole sequence.
+        self.packed_token_tags = (
+            token_tags_host.clamp(min=0).to(device) if sp_world_size > 1 else None
+        )
         self.static_kwargs: dict[str, Any] = {
             # Cast the fp64 position grid on the host. MiniMaxH3Rope casts it to
             # fp32 as its first op anyway, so the values are identical; doing the
@@ -228,6 +238,8 @@ class MiniMaxH3DenoiseBranch:
                 "max_seqlen_q": text_len,
             },
         }
+        if self.packed_token_tags is not None:
+            self.static_kwargs["token_tags"] = self.packed_token_tags
 
     def forward_kwargs(
         self,

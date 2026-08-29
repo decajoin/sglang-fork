@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MINIMAX_H3_FP32_PARAM_NAMES,
     MiniMaxH3DiTBlock,
     MiniMaxH3DiTModel,
+    _attention_row_modality_tags,
     _copy_grouped_qkv_tp_shard,
     _modulate_gate,
     _reorder_grouped_qkv_to_qkv,
@@ -529,3 +530,67 @@ def test_cuda_ulysses_qkv_pack_is_bit_exact():
 
     actual = pack_qkv_destination_major(q.contiguous(), k.contiguous(), v, world_size)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_attention_row_tags_reuse_the_rank_local_tensor_without_sequence_parallelism():
+    """The no-SP path must hand attention the exact tensor it always did.
+
+    Without Ulysses or ring the rank-local tags already cover the whole packed
+    sequence, so there is nothing to swap in. Asserting object identity rather
+    than equality is deliberate: it is what makes this a regression test for
+    the single-GPU and TP-only deployments, where the tags reaching a sparse
+    backend -- and so the blocks it keeps dense, and so the pixels -- must not
+    move at all.
+    """
+    block_tags = torch.tensor([1, 1, 0, 2, 0, 0], dtype=torch.long)
+    full_tags = torch.tensor([1, 1, 0, 2, 0, 0], dtype=torch.long)
+    for supplied in (None, full_tags):
+        assert (
+            _attention_row_modality_tags(
+                sp_ws=1,
+                block_token_tags=block_tags,
+                token_tags=supplied,
+                device=torch.device("cpu"),
+            )
+            is block_tags
+        )
+
+
+def test_attention_row_tags_use_the_full_sequence_under_sequence_parallelism():
+    """Ulysses restores the full sequence inside attention, so tags must too.
+
+    The rank-local slice is exactly what must not be published here: it would
+    be half the length attention indexes, which is how modality protection
+    silently stops protecting anything.
+    """
+    full_tags = torch.tensor([1, 1, 0, 2, 0, -1], dtype=torch.long)
+    block_tags = full_tags[:3].clamp(min=0)
+    tags = _attention_row_modality_tags(
+        sp_ws=2,
+        block_token_tags=block_tags,
+        token_tags=full_tags,
+        device=torch.device("cpu"),
+    )
+    torch.testing.assert_close(
+        tags, torch.tensor([1, 1, 0, 2, 0, 0], dtype=torch.long), rtol=0, atol=0
+    )
+
+
+def test_attention_row_tags_are_withheld_when_the_full_sequence_is_missing():
+    """No full-length copy under SP means no tags, not the wrong tags.
+
+    A caller that publishes only the rank-local slice gets None, which the
+    consuming backend turns into a dense fallback plus a warning. Losing the
+    speedup is recoverable; protecting rows that are not the ones attention is
+    looking at is not, because it looks like it worked.
+    """
+    block_tags = torch.tensor([1, 1, 0], dtype=torch.long)
+    assert (
+        _attention_row_modality_tags(
+            sp_ws=4,
+            block_token_tags=block_tags,
+            token_tags=None,
+            device=torch.device("cpu"),
+        )
+        is None
+    )

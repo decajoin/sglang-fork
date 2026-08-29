@@ -197,10 +197,16 @@ def sparge_row_modality_tags(tags: torch.Tensor | None) -> Iterator[None]:
     """Publish per-row modality tags for the rows attention will receive.
 
     ``tags`` is a 1-D integer tensor, one entry per packed row, in the same
-    row space the attention call sees. The backend validates the length
-    against the query it is handed and ignores tags that do not line up, so a
-    caller that reshuffles rows afterwards (Ulysses restores the full sequence
-    inside attention) degrades to dense rather than protecting the wrong rows.
+    row space the attention call sees -- which under Ulysses is the *whole*
+    packed sequence, not the caller's row shard, because the shard is restored
+    to full length inside the attention call. Publishing a rank-local slice
+    there is the mistake this contract exists to name.
+
+    The backend length-checks the tags against the query it is handed and runs
+    dense when they do not line up, so getting it wrong costs the speedup
+    rather than protecting the wrong rows. That check is a backstop, not a
+    routine path: a caller it fires for has published tags attention cannot
+    use, and the warning says so.
 
     A no-op for every backend other than this one.
     """
