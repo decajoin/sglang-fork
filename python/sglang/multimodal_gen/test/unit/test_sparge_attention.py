@@ -14,6 +14,8 @@ real sparsity would pin down.
 
 from __future__ import annotations
 
+import sys
+import types
 import unittest
 from unittest.mock import patch
 
@@ -22,6 +24,8 @@ import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.sparge_attn import (
     DEFAULT_HEAD_CHUNK,
+    DEFAULT_PVTHRESHD,
+    PVTHRESHD_DISABLED,
     SpargeAttentionBackend,
     SpargeAttentionImpl,
     SpargeSchedule,
@@ -41,6 +45,18 @@ def _forget_once_warnings() -> None:
     from sglang.multimodal_gen.runtime.utils import logging_utils
 
     logging_utils._print_warning_once.cache_clear()
+
+def _as_arch(arch: str):
+    """Stand in for ``spas_sage_attn.core`` reporting a given architecture.
+
+    The arch branch has to be testable on a box that does not have the
+    extension built -- and on one that does, without it reporting the real
+    card. Patching sys.modules covers both.
+    """
+    module = types.ModuleType("spas_sage_attn.core")
+    module.get_cuda_arch_versions = lambda: [arch]
+    return patch.dict(sys.modules, {"spas_sage_attn.core": module})
+
 
 # MiniMax-H3 token tags, from minimax_h3/packed_sequence.py.
 VIDEO_TAG, TEXT_TAG, AUDIO_TAG = 0, 1, 2
@@ -133,6 +149,32 @@ class TestSpargeSchedule(unittest.TestCase):
         self.assertEqual(schedule.skip_last_steps, 0)
         self.assertEqual(schedule.skip_first_layers, 0)
         self.assertEqual(schedule.min_seq_len, 4096)
+
+    def test_pvthreshd_defaults_to_disabled_on_hopper_only(self):
+        """SpargeAttn's sm90 kernel hangs with PV thresholding on.
+
+        See ``_default_pvthreshd``: the mitigation is scoped to sm90 so that
+        sm89/sm120 deployments keep the second-stage sparsity.
+        """
+        for arch, expected in (
+            ("sm90", PVTHRESHD_DISABLED),
+            ("sm89", DEFAULT_PVTHRESHD),
+            ("sm120", DEFAULT_PVTHRESHD),
+        ):
+            with self.subTest(arch=arch):
+                with _as_arch(arch), patch(
+                    "torch.cuda.current_device", return_value=0
+                ), patch(_SERVER_ARGS, return_value=_FakeServerArgs({})):
+                    self.assertEqual(
+                        SpargeSchedule.from_server_args().pvthreshd, expected
+                    )
+
+    def test_explicit_pvthreshd_wins_over_the_arch_default(self):
+        """The arch default is a default, not a lock."""
+        with _as_arch("sm90"), patch(
+            "torch.cuda.current_device", return_value=0
+        ), patch(_SERVER_ARGS, return_value=_FakeServerArgs({"pvthreshd": 50})):
+            self.assertEqual(SpargeSchedule.from_server_args().pvthreshd, 50)
 
     def test_topk_one_stays_legal(self):
         """It keeps every block, which is what the numerical tests calibrate on."""

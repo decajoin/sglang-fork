@@ -129,6 +129,39 @@ DEFAULT_CDFTHRESHD = None
 # Second-stage PV sparsity threshold. SpargeAttn's own default; the SageSLA
 # integration in this tree pins it to 1e6 (disabled) instead.
 DEFAULT_PVTHRESHD = 50
+# What "disabled" means: the kernel keeps a PV block when
+# `local_max_diff + pv_threshold > 0`, so a large enough threshold makes that
+# test unconditionally true and the skip branch unreachable.
+PVTHRESHD_DISABLED = 1_000_000
+
+
+def _default_pvthreshd() -> int:
+    """``DEFAULT_PVTHRESHD``, except on Hopper where PV thresholding hangs.
+
+    SpargeAttn compiles a separate kernel for sm90
+    (``qk_int_sv_f8_cuda_sm90``, CTA 64x128, warpgroup ``wgmma.*.sync.aligned``)
+    from the one every other supported arch uses (``..._sm89``, CTA 128x64,
+    warp-level ``mma.sync``). Only the sm90 one has been observed to hang: on
+    an 8-GPU H200 run a single rank's
+    ``qk_int8_sv_f8_attn_kernel<64u, 128u, ..., (PVThresholdMode)1, ...>``
+    stayed Active with one block left on one SM, which stalled that rank's
+    Ulysses all_to_all and deadlocked the whole SP group behind it. Disabling
+    the PV threshold -- the one thing that template parameter controls -- made
+    the same path pass repeatedly.
+
+    The hang was never reproduced from synthetic activations, so this is a
+    mitigation rather than a fix for a fully understood kernel bug. It is
+    scoped to sm90 so 5090/sm120 deployments keep the second-stage sparsity,
+    and an explicit ``pvthreshd`` in --attention-backend-config still wins.
+    """
+    try:
+        from spas_sage_attn.core import get_cuda_arch_versions
+
+        if get_cuda_arch_versions()[torch.cuda.current_device()] == "sm90":
+            return PVTHRESHD_DISABLED
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return DEFAULT_PVTHRESHD
 
 # How many heads the sparse path runs at a time.
 #
@@ -362,7 +395,7 @@ class SpargeSchedule(msgspec.Struct, frozen=True):
             ),
             min_seq_len=int(config.get("min_seq_len", DEFAULT_MIN_SEQ_LEN)),
             simthreshd1=float(config.get("simthreshd1", DEFAULT_SIMTHRESHD1)),
-            pvthreshd=int(config.get("pvthreshd", DEFAULT_PVTHRESHD)),
+            pvthreshd=int(config.get("pvthreshd", _default_pvthreshd())),
             dense_modalities=tuple(
                 int(tag)
                 for tag in config.get("dense_modalities", DEFAULT_DENSE_MODALITIES)
