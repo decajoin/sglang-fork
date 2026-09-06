@@ -216,6 +216,14 @@ def minimax_h3_packed_sequence(
         "img_position_ids": g,
         "token_tags": token_tags,
         "cu_seqlens": cu,
+        # Row-space geometry for tile-based sparse attention: the live rows
+        # before the generated video, split at every modality boundary, and
+        # the video's own patch grid. See `prefix_segments` in
+        # `attention/backends/video_sparse_attn_h3.py`.
+        "prefix_segments": tuple(
+            rows for rows in (text_len, cond_rows, audio_rows) if rows
+        ),
+        "video_grid": (latent_t, ph, pw),
     }
 
 
@@ -482,6 +490,20 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     token_tags[audio_pos] = 2  # AUDIO (refs + target)
     token_tags[img_pos] = 0  # VIDEO (refs + target)
 
+    # Prefix rows in packed order: the prompt, then each reference block as it
+    # was laid out above (a video-bearing block packs its audio before its
+    # visual rows), then the target audio. Same contract as the t2va builder.
+    prefix_segments: list[int] = [text_len]
+    for item in block_slices:
+        if str(item["kind"]) == "image":
+            prefix_segments.append(int(item["rows"]))
+        elif str(item["kind"]) == "audio":
+            prefix_segments.append(int(item["audio_rows"]))
+        else:
+            prefix_segments.append(int(item["audio_rows"]))
+            prefix_segments.append(int(item["video_rows"]))
+    prefix_segments.append(audio_rows)
+
     cu = torch.tensor([0, used, seq_len], dtype=torch.int32)
     return {
         "seq_len": seq_len,
@@ -493,6 +515,8 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         "img_position_ids": g,
         "token_tags": token_tags,
         "cu_seqlens": cu,
+        "prefix_segments": tuple(rows for rows in prefix_segments if rows),
+        "video_grid": (latent_t, ph, pw),
     }
 
 

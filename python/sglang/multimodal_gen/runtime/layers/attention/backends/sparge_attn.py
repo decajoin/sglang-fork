@@ -60,6 +60,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.denoise_schedule import (
+    denoise_total_steps,
+    get_denoise_total_steps,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -251,37 +255,11 @@ def sparge_row_modality_tags(tags: torch.Tensor | None) -> Iterator[None]:
 
 
 # Length of the denoise schedule the current run is stepping through, published
-# by the stage that owns the loop. Only ``skip_last_steps`` needs it.
-_denoise_total_steps: ContextVar[int | None] = ContextVar(
-    "sparge_denoise_total_steps", default=None
-)
-
-
-@contextmanager
-def sparge_denoise_total_steps(total: int | None) -> Iterator[None]:
-    """Publish how many denoise steps the loop about to run will take.
-
-    ``skip_last_steps`` cannot be applied without this. ``current_timestep`` is
-    a zero-based counter with no upper bound attached to it, so on its own it
-    cannot say which forward is the last one.
-
-    The caller must be whoever owns the sigma schedule, because that is the
-    only place the count is authoritative.
-    ``sampling_params.num_inference_steps`` is a request-level *hint*: for
-    MiniMax-H3 it may be a ``(video, audio)`` pair rather than an int, and the
-    loop actually runs ``len(sigmas_video) - 1``. Reading the hint instead
-    would leave the tail cutoff silently inactive on exactly the model this
-    backend targets, which is worse than not having it -- an experiment that
-    never ran looks like an experiment that came back negative.
-
-    A no-op for every backend other than this one, and for this one unless
-    ``skip_last_steps`` is set.
-    """
-    token = _denoise_total_steps.set(total)
-    try:
-        yield
-    finally:
-        _denoise_total_steps.reset(token)
+# by the stage that owns the loop. Only ``skip_last_steps`` needs it. The
+# contextvar itself lives in ``denoise_schedule`` because VSA-H3 carries the
+# same cutoff and has to read the same published value; this name stays as the
+# one the H3 denoising stage already publishes through.
+sparge_denoise_total_steps = denoise_total_steps
 
 
 # ``blocks.<idx>.attn`` is a DiT layer; ``token_refiner.blocks.<idx>.attn`` and
@@ -550,24 +528,8 @@ class SpargeAttentionImpl(AttentionImpl):
 
     @staticmethod
     def _total_steps(context) -> int | None:
-        """Length of the running denoise schedule, or None if nothing said.
-
-        The published value wins: it comes from the stage that owns the sigma
-        schedule and is what the loop actually iterates.
-        ``num_inference_steps`` is the request-level hint and only usable when
-        it really is a positive int -- MiniMax-H3 types it as
-        ``int | tuple[int, int]``, and a pair carries no single loop length.
-        """
-        published = _denoise_total_steps.get()
-        if isinstance(published, int) and published > 0:
-            return published
-        batch = getattr(context, "forward_batch", None)
-        hint = getattr(
-            getattr(batch, "sampling_params", None), "num_inference_steps", None
-        )
-        if isinstance(hint, int) and not isinstance(hint, bool) and hint > 0:
-            return hint
-        return None
+        """Length of the running denoise schedule, or None if nothing said."""
+        return get_denoise_total_steps(context)
 
     def _warn_if_the_cutoffs_swallow_the_schedule(self, total: int | None) -> None:
         """The two step cutoffs together can leave no sparse step at all.

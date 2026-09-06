@@ -221,6 +221,35 @@ class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
             raise ImportError("Video Sparse Attention backend is not installed.") from e
 
 
+class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
+
+    # The block-sparse forward is Triton, vendored in-tree, so unlike every
+    # other sparse backend here it needs no package and no arch-specific
+    # build. Triton's `tl.dot` wants Ampere or newer, which is also the floor
+    # for every dense fallback this backend can pick.
+    required_min_capability = (8, 0)
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        major, minor = cls.required_min_capability
+        capability = platform.get_device_capability()
+        if capability is None or capability.to_int() < major * 10 + minor:
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                f"VSA-H3 attention needs compute capability >= {major}.{minor}; "
+                f"this device reports {found}."
+            )
+        from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (  # noqa: F401
+            VideoSparseAttentionH3Backend,
+        )
+
+        return (
+            "sglang.multimodal_gen.runtime.layers.attention.backends."
+            "video_sparse_attn_h3.VideoSparseAttentionH3Backend"
+        )
+
+
 class _SparseVideoGen2AttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN
 
@@ -408,6 +437,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SageAttentionBackendResolver,
         _SageAttention3BackendResolver,
         _VideoSparseAttentionBackendResolver,
+        _VideoSparseAttentionH3BackendResolver,
         _SparseVideoGen2AttentionBackendResolver,
         _SolAttnBackendResolver,
         _VMOBAAttentionBackendResolver,

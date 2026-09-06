@@ -6,7 +6,7 @@ single-branch execution, and payload validation.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import lru_cache, partial
 from typing import Any
 
@@ -71,6 +71,48 @@ def _denoise_total_steps_publisher():
 
 def _denoise_total_steps_ctx(total: int):
     return _denoise_total_steps_publisher()(total)
+
+
+@lru_cache(maxsize=1)
+def _vsa_h3_geometry_publisher():
+    """Resolve the VSA-H3 sequence-geometry publisher, or a no-op.
+
+    Only ``video_sparse_attn_h3`` consumes the geometry. Resolving it lazily
+    and degrading to ``nullcontext`` keeps every other backend on exactly the
+    path it had before, and mirrors the two publishers above it.
+    """
+    try:
+        from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+            VsaH3SequenceGeometry,
+            vsa_h3_sequence_geometry,
+        )
+
+        def publish(packed: Mapping[str, Any]):
+            segments = packed.get("prefix_segments")
+            grid = packed.get("video_grid")
+            if segments is None or grid is None:
+                return nullcontext()
+            return vsa_h3_sequence_geometry(
+                VsaH3SequenceGeometry(
+                    prefix_segments=tuple(int(rows) for rows in segments),
+                    video_grid=tuple(int(axis) for axis in grid),
+                )
+            )
+
+        return publish
+    except Exception:  # pragma: no cover - defensive
+        return lambda _packed: nullcontext()
+
+
+def _vsa_h3_geometry_ctx(packed: Mapping[str, Any]):
+    """Publish the packed layout VSA-H3 needs to tile the sequence.
+
+    The layout is request-static, so it is published once around the whole
+    denoise loop rather than per step. It describes the rows *attention* sees:
+    the full packed sequence on every rank, which is what the loop's packed
+    layout already is.
+    """
+    return _vsa_h3_geometry_publisher()(packed)
 
 
 def minimax_h3_condition_noise_aug(sampling: Any) -> tuple[float, float]:
@@ -682,6 +724,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 # authoritative here and nowhere else, and sparge_attn's tail
                 # cutoff cannot identify the last step without it.
                 _denoise_total_steps_ctx(len(sigmas_video) - 1),
+                # Which rows are prefix and what the video grid is; VSA-H3
+                # cannot tile the packed sequence without it and runs dense.
+                _vsa_h3_geometry_ctx(packed),
                 self.progress_bar(
                     total=len(sigmas_video) - 1,
                     batch=batch,
