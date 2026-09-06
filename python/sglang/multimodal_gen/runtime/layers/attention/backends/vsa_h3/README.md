@@ -34,7 +34,7 @@ lazily on the first forward, outside the component-loading context.
 | | |
 | --- | --- |
 | GPU | compute capability >= 8.0. The block-sparse forward is Triton and vendored in-tree, so unlike every other sparse backend here it needs no package and no arch-specific build. |
-| dtype | bfloat16 (P.V accumulates in bf16; Q.K is INT8 unless `quantize` is off) |
+| dtype | bfloat16 in and out; Q.K runs INT8 and P.V optionally FP8 e4m3 inside |
 | head_dim | 64 or 128 |
 | attention | non-causal, MHA (`num_kv_heads == num_heads`), one packed H3 document per call |
 
@@ -88,6 +88,30 @@ the same error this deployment already carries: `sage_attn` is what the backend
 falls back to on the warmup steps. Against it, the sparsity is by far the larger
 approximation. Turn it off to separate a quality question from the sparsity.
 
+`quantize_pv` (**off** by default) does the same to the second GEMM: V is
+quantized to fp8 e4m3 into a tile-ordered buffer, P is scaled into e4m3's top
+range in registers, and the accumulation stays fp32. V is centred per channel
+before quantizing and its mean added back after the softmax normalisation,
+which is exact — the weights sum to one — and which is the point: e4m3 has
+three mantissa bits, so a channel bias every row shares would otherwise be
+re-quantized on every row instead of carried.
+
+It is off because of the trade, not the mechanism:
+
+| | speed | added error |
+| --- | ---: | ---: |
+| INT8 Q.K | 1.9x | 1.3% |
+| \+ FP8 P.V | 1.11-1.16x more | up to 3.9% |
+
+Three times the error for a tenth of the speed is a worse bargain than the
+first GEMM's. That 3.9% is also the *synthetic* worst case — zero-mean random
+V, where three mantissa bits are all the precision there is. Against a V with a
+per-channel bias, which is what real activations look like, the same path
+measures 0.10–0.19%, and the centring is what keeps it there (without it the
+error *grows* with the bias: 0.29% at 1x, 0.67% at 20x; with it, 0.10% and
+0.08%). If a measured render says it is invisible on this model, it is one key
+to flip.
+
 ## Configuration
 
 | key | default | meaning |
@@ -100,6 +124,7 @@ approximation. Turn it off to separate a quality question from the sparsity.
 | `dense_layers` | `[]` | individual DiT blocks kept dense |
 | `min_seq_len` | 4096 | shorter sequences run dense |
 | `quantize` | true | run Q.K on INT8 tensor cores, K's per-channel mean removed first |
+| `quantize_pv` | false | also run P.V on FP8 tensor cores, V centred per channel first. Has no effect when `quantize` is off |
 | `head_chunk` | 0 | heads per pass; 0 sizes the slice from the budget below. An explicit count overrides it; a count at or above the head count runs them all in one pass. Slicing is exact, not an approximation |
 | `head_chunk_budget_mib` | 512 | transient budget per attention call, which the automatic slice is sized to hit |
 
@@ -130,17 +155,23 @@ occupancy to cost ~40%.
 One RTX 5090, D=128, bf16, against bf16 SDPA at the same shape. The whole
 backend call, selection and the dense prefix launch included:
 
-| | SDPA | 0.9 bf16 | **0.9 INT8** | 0.95 bf16 | **0.95 INT8** |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 36k rows, 14 heads | 44.0 ms | 15.8 ms (2.8x) | **8.8 ms (5.0x)** | 12.3 ms (3.6x) | **7.1 ms (6.2x)** |
-| 116k rows, 28 heads | 888.6 ms | 226.5 ms (3.9x) | **117.2 ms (7.6x)** | 152.6 ms (5.8x) | **80.3 ms (11.1x)** |
+| | SDPA | bf16 | **INT8 Q.K** | + FP8 P.V |
+| --- | ---: | ---: | ---: | ---: |
+| 36k rows, 14 heads, s=0.9 | 43.8 ms | 15.6 ms (2.8x) | **8.7 ms (5.1x)** | 7.5 ms (5.8x) |
+| 36k rows, 14 heads, s=0.95 | 43.8 ms | 12.2 ms (3.6x) | **6.9 ms (6.4x)** | 6.1 ms (7.1x) |
+| 116k rows, 28 heads, s=0.9 | 880.5 ms | 225.0 ms (3.9x) | **115.0 ms (7.7x)** | 103.1 ms (8.5x) |
+| 116k rows, 28 heads, s=0.95 | 880.5 ms | 152.1 ms (5.8x) | **79.6 ms (11.1x)** | 71.8 ms (12.3x) |
 
-Two things hold the sparse column back from the ratio the tile counts suggest,
-and both are the exempt prefix: a video query tile keeps its selected video
-tiles *plus* every prefix tile, and the prefix query tiles run dense over the
-whole sequence. `{"prefix_mode": "compete"}` spends the same budget without that
-surcharge, and is the ablation to run if the prefix turns out not to need
-protecting on your workload.
+Sparsity is not density. `sparsity=0.9` drops 90% of the *video* key tiles, but
+a video query tile also keeps every prefix tile and the prefix query tiles run
+dense, so the fraction of tile pairs actually computed is 18.3% at 36k rows and
+14.2% at 116k, not 10%. The surcharge shrinks as the sequence grows, because the
+prefix is a fixed number of rows -- which is why the speedups improve with
+resolution rather than holding flat.
+
+`{"prefix_mode": "compete"}` does not change that: its budget is `k + n_prefix`
+tiles by construction, so it computes exactly as much and only reallocates which
+tiles it spends on. It is a quality ablation, not a speed knob.
 
 Attention is only part of a denoise step, so the end-to-end gain is smaller.
 
@@ -154,9 +185,6 @@ Attention is only part of a denoise step, so the end-to-end gain is smaller.
   sm_10x; 64 is the geometry FastVideo's own checkpoint is trained and measured
   at, and the one the vendored Triton kernel is built for.
 - **Training.** Forward only: no backward kernel, no autograd wrapper.
-- **FP8 P.V.** SageAttention2 quantizes the second GEMM as well; here it stays
-  bf16, which is the conservative half of the trade and leaves that speedup on
-  the table.
 
 ## This is not free accuracy
 

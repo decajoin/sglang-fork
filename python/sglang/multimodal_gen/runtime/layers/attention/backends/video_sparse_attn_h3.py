@@ -64,7 +64,9 @@ the head slice is sized from ``head_chunk_budget_mib`` so the remaining
 transients, K and the score matrix that grows with the square of the sequence,
 stay inside a budget instead of scaling with the resolution. Q.K then runs on
 INT8 tensor cores by default, SageAttention-style, which is where most of the
-speed comes from; ``{"quantize": false}`` returns the kernel to bf16.
+speed comes from; ``{"quantize": false}`` returns the kernel to bf16, and
+``{"quantize_pv": true}`` takes P.V to FP8 as well -- measured, off by default,
+and the trade is written out at ``DEFAULT_QUANTIZE_PV``.
 """
 
 from __future__ import annotations
@@ -172,6 +174,24 @@ DEFAULT_HEAD_CHUNK_BUDGET_MIB = 512
 # dense fallback this backend already falls back to carries. Turn it off to
 # separate a quality question from the sparsity, which is the much larger term.
 DEFAULT_QUANTIZE = True
+# Whether P.V runs on FP8 tensor cores as well -- the other half of what
+# SageAttention2 does. Off by default, and the reason is the trade rather than
+# the mechanism: measured on one RTX 5090 it buys 11-16% of the attention op
+# (5.06x -> 5.84x at 36k rows and sparsity 0.9, 7.66x -> 8.54x at 116k) for up
+# to 3.9% of the output's norm, against 1.3% for INT8 Q.K alone. Three times
+# the error for a tenth of the speed is a worse bargain than the first GEMM's,
+# and it is not one to take on someone's renders unmeasured.
+#
+# That 3.9% is the worst case, and it is the *synthetic* case: it was measured
+# on zero-mean random V, where e4m3's three mantissa bits are all the precision
+# there is. Real attention values carry a per-channel bias, and against one the
+# same path measures 0.10-0.19% -- because V is centred before it is quantized
+# and the mean added back after the softmax normalisation, which is exact and
+# which is what that centring is for. If a measured render says the error is
+# invisible on this model, this is a one-key change.
+DEFAULT_QUANTIZE_PV = False
+# The largest finite e4m3 value; V's scale is its amax over this.
+FP8_MAX = 448.0
 # Whether prefix keys are exempt from the budget or compete inside it.
 DEFAULT_PREFIX_MODE = "exempt"
 _PREFIX_MODES = ("exempt", "compete")
@@ -450,12 +470,14 @@ class VsaH3Schedule(msgspec.Struct, frozen=True):
     head_chunk: int
     head_chunk_budget_mib: int
     quantize: bool
+    quantize_pv: bool
 
     @classmethod
     def from_server_args(cls) -> "VsaH3Schedule":
         from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
         config = get_global_server_args().attention_backend_config or {}
+        quantize = bool(config.get("quantize", DEFAULT_QUANTIZE))
         schedule = VsaH3Schedule(
             # `VSA_sparsity` is what the Wan VSA backend's stages already put
             # in this bag; accept it so a run can switch between the two
@@ -479,7 +501,11 @@ class VsaH3Schedule(msgspec.Struct, frozen=True):
             head_chunk_budget_mib=int(
                 config.get("head_chunk_budget_mib", DEFAULT_HEAD_CHUNK_BUDGET_MIB)
             ),
-            quantize=bool(config.get("quantize", DEFAULT_QUANTIZE)),
+            quantize=quantize,
+            # ``quantize`` is the master switch: turning it off has to give the
+            # reference kernel, not one quantized GEMM out of two.
+            quantize_pv=quantize
+            and bool(config.get("quantize_pv", DEFAULT_QUANTIZE_PV)),
         )
         # sparsity == 0 keeps every tile and is the calibration setting the
         # tests use against dense attention, so it has to stay legal; 1.0 would
@@ -712,7 +738,8 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         """Heads per pass, from the configured budget when none was given.
 
         What a pass costs, per head: the key buffer laid out in tile order (one
-        byte per element quantized, two otherwise), the two pooled tile means,
+        byte per element quantized, two otherwise), the fp8 value buffer when
+        P.V is quantized too, the two pooled tile means,
         the ``tiles x tiles`` fp32 score matrix and the index list the selection
         produces. Q, V and the output are the caller's tensors, read and written
         in place, and cost nothing here.
@@ -735,8 +762,10 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         # the kernel is finally handed.
         score_columns = tiles if compete else video_tiles
         chosen = min(topk + tiles, tiles) if compete else topk
+        value_bytes = 1 if self.schedule.quantize_pv else 0
         per_head = (
             geometry.padded_rows * self.head_size * key_bytes  # tiled K
+            + geometry.padded_rows * self.head_size * value_bytes  # the fp8 V
             + 2 * tiles * self.head_size * 4  # the two pooled tile means
             + video_tiles * score_columns * 4  # the score matrix
             + video_tiles * chosen * 16  # top-k's values, indices and copies
@@ -834,6 +863,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         tiles, prefix_tiles = geometry.num_tiles, geometry.num_prefix_tiles
         topk = compute_topk(self.schedule.sparsity, geometry.num_video_tiles)
         quantize = self.schedule.quantize
+        quantize_pv = self.schedule.quantize_pv
         out = torch.empty_like(query)
         chunk = self._head_chunk_for(geometry, heads, query.element_size())
 
@@ -841,7 +871,8 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
             f"VSA-H3 attention active: {tiles} tiles ({prefix_tiles} prefix + "
             f"{geometry.num_video_tiles} video), keeping {topk}/"
             f"{geometry.num_video_tiles} video tiles per video query tile, "
-            f"{'INT8 Q.K' if quantize else 'bf16 Q.K'}, heads={heads} in slices "
+            f"{'INT8' if quantize else 'bf16'} Q.K and "
+            f"{'FP8' if quantize_pv else 'bf16'} P.V, heads={heads} in slices "
             f"of {chunk}"
         )
 
@@ -866,6 +897,39 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
                 )
             else:
                 key_tiled = self._tile_key(k_slice, geometry)
+
+            value_scale = value_mean = None
+            value_operand = v_slice
+            if quantize_pv:
+                # V is centred per channel before it is quantized, and the mean
+                # is added back after the softmax normalisation -- exact,
+                # because the weights sum to one, and it is what stops e4m3's
+                # three mantissa bits from being spent on a bias every row
+                # shares. The scale is bounded rather than measured on the
+                # centred tensor: amax|v - vm| <= amax|v| + amax|vm|, and a
+                # slightly loose fp8 scale costs no precision because e4m3
+                # carries its own exponent. Both are computed without an
+                # intermediate -- abs() or a subtraction would materialise the
+                # full-width copy of V this backend exists not to allocate.
+                value_mean = v_slice.mean(dim=0, dtype=torch.float32).contiguous()
+                value_scale = (
+                    (
+                        torch.maximum(
+                            v_slice.amax(dim=(0, 2)), v_slice.amin(dim=(0, 2)).neg()
+                        ).to(torch.float32)
+                        + value_mean.abs().amax(dim=-1)
+                    )
+                    / FP8_MAX
+                ).contiguous()
+                value_operand, _ = quantize_tiles(
+                    v_slice,
+                    tile_rows,
+                    sizes,
+                    tiles,
+                    channel_mean=value_mean,
+                    fixed_scale=value_scale,
+                    dtype=torch.float8_e4m3fn,
+                )
 
             # Selection runs on the unquantized rows: it only has to rank tiles,
             # and pooling is a mean over 64 rows, so it is cheap either way.
@@ -898,7 +962,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
                 block_sparse_attn_forward(
                     q_slice,
                     key_tiled,
-                    v_slice,
+                    value_operand,
                     out_slice,
                     tile_rows,
                     dense_index,
@@ -906,13 +970,15 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
                     sizes,
                     0,
                     key_scale,
+                    value_scale,
+                    value_mean,
                 )
                 del dense_index, dense_num
 
             block_sparse_attn_forward(
                 q_slice,
                 key_tiled,
-                v_slice,
+                value_operand,
                 out_slice,
                 tile_rows,
                 q2k_index,
@@ -920,8 +986,11 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
                 sizes,
                 prefix_tiles,
                 key_scale,
+                value_scale,
+                value_mean,
             )
             del q2k_index, q2k_num, key_tiled, key_scale
+            del value_scale, value_mean, value_operand
 
         return out
 

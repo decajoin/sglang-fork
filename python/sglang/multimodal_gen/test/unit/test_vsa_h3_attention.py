@@ -33,6 +33,7 @@ import torch.nn.functional as F
 from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
     DEFAULT_HEAD_CHUNK_BUDGET_MIB,
     DEFAULT_QUANTIZE,
+    DEFAULT_QUANTIZE_PV,
     DEFAULT_SKIP_FIRST_STEPS,
     DEFAULT_SPARSITY,
     VideoSparseAttentionH3Backend,
@@ -180,6 +181,7 @@ class TestVsaH3Schedule(unittest.TestCase):
         self.assertEqual(schedule.prefix_mode, "exempt")
         self.assertEqual(schedule.head_chunk, 0)
         self.assertIs(schedule.quantize, DEFAULT_QUANTIZE)
+        self.assertIs(schedule.quantize_pv, DEFAULT_QUANTIZE and DEFAULT_QUANTIZE_PV)
         self.assertEqual(schedule.head_chunk_budget_mib, DEFAULT_HEAD_CHUNK_BUDGET_MIB)
 
     def test_accepts_the_wan_vsa_sparsity_key(self):
@@ -191,6 +193,14 @@ class TestVsaH3Schedule(unittest.TestCase):
             return_value=_FakeServerArgs({"VSA_sparsity": 0.75, "sparsity": 0.5}),
         ):
             self.assertEqual(VsaH3Schedule.from_server_args().sparsity, 0.5)
+
+    def test_quantize_is_the_master_switch(self):
+        """Turning it off has to give the reference kernel, not half of one."""
+        with patch(
+            _SERVER_ARGS,
+            return_value=_FakeServerArgs({"quantize": False, "quantize_pv": True}),
+        ):
+            self.assertFalse(VsaH3Schedule.from_server_args().quantize_pv)
 
     def test_zero_sparsity_stays_legal(self):
         """It is the calibration setting these tests check dense against."""
@@ -522,14 +532,18 @@ class TestVsaH3Numerics(unittest.TestCase):
         torch.testing.assert_close(out[:live], reference, atol=2e-3, rtol=2e-2)
         self.assertTrue(bool((out[live:] == 0).all()))
 
-    def test_int8_stays_inside_its_error_budget(self):
-        """INT8 Q.K is an approximation, so it is bounded, not compared.
+    def test_quantization_stays_inside_its_error_budget(self):
+        """Quantization is an approximation, so it is bounded, not compared.
 
-        Element-wise closeness is the wrong assertion for a quantized kernel:
-        a handful of near-zero outputs will always disagree in the last bits.
-        What has to hold is that the whole output barely moves -- 1.3% of its
-        norm is what SageAttention costs and what the dense fallback this
-        backend falls back to already carries.
+        Element-wise closeness is the wrong assertion for a quantized kernel: a
+        handful of near-zero outputs will always disagree in the last bits.
+        What has to hold is that the whole output barely moves.
+
+        The two budgets are different because the two GEMMs are: INT8 Q.K costs
+        1.3% of the output's norm, which is SageAttention's own figure and what
+        the dense fallback already carries, while FP8 P.V costs up to 3.9% on
+        the zero-mean random values this test generates -- its worst case, and
+        the reason it is off by default.
         """
         for sparsity in (0.0, 0.9):
             config = {
@@ -538,14 +552,39 @@ class TestVsaH3Numerics(unittest.TestCase):
                 "min_seq_len": 64,
             }
             reference = self._run(_make_impl({**config, "quantize": False})).float()
-            quantized = self._run(_make_impl({**config, "quantize": True})).float()
-            relative = ((reference - quantized).norm() / reference.norm()).item()
-            cosine = F.cosine_similarity(
-                reference.flatten(), quantized.flatten(), dim=0
-            ).item()
-            with self.subTest(sparsity=sparsity):
-                self.assertLess(relative, 0.02)
-                self.assertGreater(cosine, 0.9995)
+            for quantize_pv, budget in ((False, 0.02), (True, 0.05)):
+                quantized = self._run(
+                    _make_impl({**config, "quantize": True, "quantize_pv": quantize_pv})
+                ).float()
+                relative = ((reference - quantized).norm() / reference.norm()).item()
+                cosine = F.cosine_similarity(
+                    reference.flatten(), quantized.flatten(), dim=0
+                ).item()
+                with self.subTest(sparsity=sparsity, quantize_pv=quantize_pv):
+                    self.assertLess(relative, budget)
+                    self.assertGreater(cosine, 0.999)
+
+    def test_fp8_pv_is_exact_about_the_channel_mean(self):
+        """V is centred before quantizing and the mean added back after.
+
+        The weights sum to one, so that round trip is exact -- and it is the
+        whole point: e4m3 has three mantissa bits, so a channel bias every row
+        shares would otherwise be quantized over and over instead of carried.
+        A biased V is the case that separates the two, and the one real
+        activations look like.
+        """
+        biased = self.v + 8.0 * torch.randn(
+            1, NUM_HEADS, HEAD_DIM, device=self.device, dtype=torch.bfloat16
+        )
+        config = {"sparsity": 0.9, "skip_first_steps": 0, "min_seq_len": 64}
+        reference = self._run(
+            _make_impl({**config, "quantize": False}), v=biased
+        ).float()
+        quantized = self._run(
+            _make_impl({**config, "quantize": True, "quantize_pv": True}), v=biased
+        ).float()
+        relative = ((reference - quantized).norm() / reference.norm()).item()
+        self.assertLess(relative, 0.01)
 
     def test_a_warmup_step_takes_the_dense_path(self):
         impl = _make_impl({"sparsity": 0.9, "skip_first_steps": 10, "min_seq_len": 64})

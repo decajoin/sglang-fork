@@ -104,6 +104,7 @@ def _quantize_tiles(
     stride_oh,
     stride_os,
     stride_sh,
+    FIXED_SCALE: tl.constexpr,
     SMOOTH: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -129,26 +130,46 @@ def _quantize_tiles(
     if SMOOTH:
         mean = tl.load(Mean + head * HEAD_DIM + offs_d)
         x = tl.where(valid[:, None], x - mean[None, :], 0.0)
-    scale = tl.max(tl.abs(x)) / 127.0
-    scale = tl.where(scale > 0, scale, 1.0)
-    quantized = tl.extra.cuda.libdevice.round(x / scale).to(tl.int8)
-    tl.store(
-        Out
-        + head * stride_oh
-        + (tile * BLOCK + offs)[:, None] * stride_os
-        + offs_d[None, :],
-        quantized,
-    )
-    tl.store(Scale + head * stride_sh + tile, scale)
+    if FIXED_SCALE:
+        # One scale per head, supplied by the caller: e4m3 carries its own
+        # exponent, so a shared scale costs no mantissa precision, and a
+        # loop-invariant scale is what keeps the P.V accumulation fused.
+        scale = tl.load(Scale + head)
+        tl.store(
+            Out
+            + head * stride_oh
+            + (tile * BLOCK + offs)[:, None] * stride_os
+            + offs_d[None, :],
+            (x / scale).to(Out.type.element_ty),
+        )
+    else:
+        scale = tl.max(tl.abs(x)) / 127.0
+        scale = tl.where(scale > 0, scale, 1.0)
+        tl.store(
+            Out
+            + head * stride_oh
+            + (tile * BLOCK + offs)[:, None] * stride_os
+            + offs_d[None, :],
+            tl.extra.cuda.libdevice.round(x / scale).to(tl.int8),
+        )
+        tl.store(Scale + head * stride_sh + tile, scale)
 
 
-@triton.autotune(_CONFIGS, key=["N_CTX_KV", "HEAD_DIM", "QUANT"])
+# The largest finite e4m3 value. P is in (0, 1], so scaling it here costs
+# nothing and moves the small end of the distribution out of the subnormal
+# range instead of flushing it to zero.
+_FP8_MAX = tl.constexpr(448.0)
+
+
+@triton.autotune(_CONFIGS, key=["N_CTX_KV", "HEAD_DIM", "QUANT", "QUANT_PV"])
 @triton.jit
 def _attn_fwd_sparse(
     Q,
     K,
     K_SCALE,
     V,
+    V_SCALE,
+    V_MEAN,
     Out,
     sm_scale,
     tile_rows,
@@ -170,6 +191,7 @@ def _attn_fwd_sparse(
     Q_TILE_OFFSET,
     N_Q_TILES,
     QUANT: tl.constexpr,
+    QUANT_PV: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -213,11 +235,31 @@ def _attn_fwd_sparse(
         block_shape=(HEAD_DIM, BLOCK_N),
         order=(0, 1),
     )
+    if QUANT_PV:
+        # The fp8 V is in tile order too: quantizing it once beats converting a
+        # gathered bf16 tile in registers on every (query tile, key tile) pair,
+        # which is what made a first FP8 attempt slower than bf16 P.V.
+        V_base = tl.make_block_ptr(
+            base=V + head.to(tl.int64) * stride_vh,
+            shape=(N_CTX_KV, HEAD_DIM),
+            strides=(stride_vs, 1),
+            offsets=(0, 0),
+            block_shape=(BLOCK_N, HEAD_DIM),
+            order=(1, 0),
+        )
 
     m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     qk_scale = sm_scale * 1.44269504  # 1/ln2
+    if QUANT_PV:
+        # One scale per head rather than per tile: e4m3 carries its own
+        # exponent, so a shared scale costs no mantissa precision as long as
+        # nothing overflows, and a loop-invariant scale keeps the accumulation
+        # fused into one tl.dot chain.
+        v_scale = tl.load(V_SCALE + head)
+    else:
+        v_scale = 1.0
 
     for i in range(0, kv_blocks):
         kv_idx = tl.load(kv_ptr + i).to(tl.int32)
@@ -240,18 +282,33 @@ def _attn_fwd_sparse(
         l_i = l_i * alpha + l_ij
         acc = acc * alpha[:, None]
 
-        v_rows = tl.load(tile_rows + kv_idx * BLOCK_N + offs_n, mask=live, other=0).to(
-            tl.int64
-        )
-        v = tl.load(
-            V + v_rows[:, None] * stride_vs + head * stride_vh + offs_d[None, :],
-            mask=live[:, None],
-            other=0.0,
-        )
-        acc = tl.dot(p.to(tl.bfloat16), v, acc)
+        if QUANT_PV:
+            acc = tl.dot(
+                (p * _FP8_MAX).to(tl.float8e4nv),
+                tl.load(tl.advance(V_base, (kv_idx * BLOCK_N, 0))),
+                acc,
+            )
+        else:
+            v_rows = tl.load(
+                tile_rows + kv_idx * BLOCK_N + offs_n, mask=live, other=0
+            ).to(tl.int64)
+            v = tl.load(
+                V + v_rows[:, None] * stride_vs + head * stride_vh + offs_d[None, :],
+                mask=live[:, None],
+                other=0.0,
+            )
+            acc = tl.dot(p.to(tl.bfloat16), v, acc)
         m_i = m_ij
 
+    if QUANT_PV:
+        acc = acc * (v_scale / _FP8_MAX)
     acc = acc / l_i[:, None]
+    if QUANT_PV:
+        # V was centred before quantizing. The weights sum to one after the
+        # division above, so adding the mean back here is exact -- and it is
+        # what stops e4m3's three mantissa bits from being spent on a channel
+        # bias that every row shares.
+        acc = acc + tl.load(V_MEAN + head * HEAD_DIM + offs_d)[None, :]
     tl.store(
         Out + q_rows[:, None] * stride_os + head * stride_oh + offs_d[None, :],
         acc.to(Out.type.element_ty),
@@ -289,18 +346,29 @@ def quantize_tiles(
     variable_block_sizes: torch.Tensor,
     num_tiles: int,
     channel_mean: torch.Tensor | None = None,
+    fixed_scale: torch.Tensor | None = None,
+    dtype: torch.dtype = torch.int8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Packed ``[S, H, D]`` rows -> int8 ``[H, num_tiles * 64, D]`` and scales.
+    """Packed ``[S, H, D]`` rows -> quantized ``[H, num_tiles * 64, D]``.
 
-    ``channel_mean`` is K's per-head, per-channel mean over the live rows. It is
-    subtracted before quantizing, which softmax cancels exactly and which is
-    what makes int8 usable on a K with a channel bias.
+    With ``fixed_scale`` ``[H]`` the caller's scale is used as is and returned
+    unchanged -- what the fp8 V buffer wants, because a loop-invariant scale is
+    what keeps the P.V accumulation fused into one ``tl.dot`` chain. Otherwise
+    each tile gets its own int8 scale, which is what K wants.
+
+    ``channel_mean`` is the per-head, per-channel mean over the live rows. It is
+    subtracted before quantizing; for K softmax cancels the resulting constant
+    shift exactly, and it is what makes int8 usable on a K with a channel bias.
     """
     heads, dim = x.shape[1], x.shape[2]
     out = torch.empty(
-        (heads, num_tiles * BLOCK_SIZE, dim), dtype=torch.int8, device=x.device
+        (heads, num_tiles * BLOCK_SIZE, dim), dtype=dtype, device=x.device
     )
-    scale = torch.empty((heads, num_tiles), dtype=torch.float32, device=x.device)
+    scale = (
+        fixed_scale
+        if fixed_scale is not None
+        else torch.empty((heads, num_tiles), dtype=torch.float32, device=x.device)
+    )
     _quantize_tiles[(num_tiles, heads, 1)](
         x,
         tile_rows,
@@ -313,6 +381,7 @@ def quantize_tiles(
         out.stride(0),
         out.stride(1),
         scale.stride(0),
+        FIXED_SCALE=fixed_scale is not None,
         SMOOTH=channel_mean is not None,
         HEAD_DIM=dim,
         BLOCK=BLOCK_SIZE,
@@ -331,6 +400,8 @@ def block_sparse_attn_forward(
     variable_block_sizes: torch.Tensor,
     q_tile_offset: int,
     key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
+    value_mean: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Block-sparse attention for one contiguous run of query tiles.
 
@@ -338,7 +409,11 @@ def block_sparse_attn_forward(
     through ``tile_rows`` (``[num_tiles * 64]`` int32: the packed row each tiled
     slot holds, 0 and masked for the pad slots of a partial tile).
     ``key_tiled`` is ``[H, num_tiles * 64, D]``, bf16 or int8; int8 requires
-    ``key_scale`` ``[H, num_tiles]``.
+    ``key_scale`` ``[H, num_tiles]``. ``value`` is the packed rows unless
+    ``value_scale`` ``[H]`` is given, in which case it is an fp8 ``[H, num_tiles
+    * 64, D]`` buffer holding ``(V - value_mean) / value_scale`` and P.V runs on
+    FP8 tensor cores, with ``value_mean`` ``[H, D]`` added back after the
+    softmax normalisation.
 
     ``q2k_index`` is ``[H, q_tiles, W]`` int32 -- for each query tile of *this
     launch*, the key tiles it attends to in the first ``q2k_num[h, i]`` slots.
@@ -349,8 +424,11 @@ def block_sparse_attn_forward(
     heads, kv_len, dim = key_tiled.shape
     q_tiles = q2k_num.shape[-1]
     quantized = key_tiled.dtype is torch.int8
+    quantized_pv = value_scale is not None
     if quantized and key_scale is None:
         raise ValueError("an int8 key buffer needs its per-tile scales")
+    if quantized_pv and value_mean is None:
+        raise ValueError("an fp8 value buffer needs the channel mean it was centred on")
     if kv_len % BLOCK_SIZE:
         raise ValueError(f"key buffer must be tile-aligned, got {kv_len} rows")
     if variable_block_sizes.numel() != kv_len // BLOCK_SIZE:
@@ -369,6 +447,8 @@ def block_sparse_attn_forward(
         key_tiled,
         key_scale if quantized else key_tiled,
         value,
+        value_scale if quantized_pv else value,
+        value_mean if quantized_pv else value,
         out,
         1.0 / math.sqrt(dim),
         tile_rows,
@@ -382,14 +462,17 @@ def block_sparse_attn_forward(
         key_tiled.stride(1),
         key_tiled.stride(2),
         key_scale.stride(0) if quantized else 0,
-        value.stride(0),
-        value.stride(1),
+        # The two V layouts put the row and head axes the other way round:
+        # packed rows are [S, H, D], the fp8 tile buffer is [H, S_padded, D].
+        value.stride(1) if quantized_pv else value.stride(0),
+        value.stride(0) if quantized_pv else value.stride(1),
         out.stride(0),
         out.stride(1),
         kv_len,
         q_tile_offset,
         q_tiles,
         QUANT=quantized,
+        QUANT_PV=quantized_pv,
         HEAD_DIM=dim,
     )
     return out
