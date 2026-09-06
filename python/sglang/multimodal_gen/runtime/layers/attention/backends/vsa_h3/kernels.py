@@ -1,26 +1,45 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-# (fastvideo_kernel/triton_kernels/block_sparse_attn_triton.py, itself derived
-# from the OpenAI Triton FlashAttention-2 tutorial).
-"""64x64 block-sparse attention forward, in Triton.
+# The block-sparse forward is copied and adapted from:
+# https://github.com/hao-ai-lab/FastVideo (fastvideo_kernel/triton_kernels/
+# block_sparse_attn_triton.py, itself derived from the OpenAI Triton
+# FlashAttention-2 tutorial). The INT8 quantization of Q.K follows
+# SageAttention (https://github.com/thu-ml/SageAttention).
+"""64x64 block-sparse attention over a re-ordered sequence, in Triton.
 
 Vendored rather than taken from a package so the VSA-H3 backend has no
 external dependency: the upstream wheel (``fastvideo-kernel``) is pinned to one
 Torch minor and carries compiled CUDA extensions this backend does not use.
-Only the forward kernel is here -- this tree is inference-only, and the
-autograd wrapper, the two backward kernels and the sm_90/sm_100a CUDA routes
-that surround it upstream all serve training or hardware we do not target.
+Forward only -- this tree is inference-only, and the autograd wrapper, the two
+backward kernels and the sm_90/sm_100a CUDA routes that surround it upstream
+all serve training or hardware we do not target.
 
 The unit is a 64-token tile. Which key tiles a query tile attends to is given
-per (batch, head, query tile) as an explicit index list plus a count, so the
-kernel never sees the selection rule -- ``video_sparse_attn_h3.py`` owns that.
-Tiles may be partially filled: ``variable_block_sizes`` gives each key tile's
-live token count and the kernel masks the rest to -inf, which is what lets a
-packed sequence whose segments are not multiples of 64 be tiled at all.
+per (head, query tile) as an explicit index list plus a count, so the kernels
+never see the selection rule -- ``video_sparse_attn_h3.py`` owns that. Tiles may
+be partially filled: ``variable_block_sizes`` gives each tile's live token
+count and everything past it is masked, which is what lets a packed sequence
+whose segments are not multiples of 64 be tiled at all.
 
-``BLOCK_M``/``BLOCK_N`` are fixed at 64 because they are structural, not
-tunable: the index list addresses keys as ``kv_idx * BLOCK_N``, so both must
-match the granularity the caller built its tiles at.
+Two things separate this from the upstream kernel, and both exist because the
+sequence VSA-H3 tiles is 100k+ rows on a 32 GiB card:
+
+**Nothing is materialised in tile order except K.** Upstream permutes Q, K and
+V into padded tile buffers and permutes the output back, which is four
+full-width copies per attention call -- 3.2 GiB at 28 rank-local heads and a
+116k-row sequence, on top of an activation footprint that already fills the
+card. Here ``tile_rows`` maps each tiled slot to its packed row and the kernels
+gather Q and V through it and scatter the output back, so only K -- read by
+every query tile, and read transposed -- is worth laying out contiguously.
+
+**Q.K can run in INT8.** ``quantize_tiles`` writes K as int8 with one scale per
+tile; the attention kernel quantizes each Q tile in registers and runs the
+first GEMM on INT8 tensor cores, which is ~1.9x the whole call on an RTX 5090.
+P.V stays bf16. Subtracting K's per-channel mean before quantizing costs
+nothing and is exact: it shifts every logit in a row by the same ``-q.km``,
+which softmax cancels, and it is what keeps the int8 range useful when K has a
+large channel bias. Measured against the bf16 path, the added error is 1.3% of
+the output's norm at any sparsity -- SageAttention's own budget, and the same
+error the dense fallback (``sage_attn``) already carries.
 """
 
 import math
@@ -29,119 +48,189 @@ import torch
 import triton
 import triton.language as tl
 
+BLOCK_SIZE = 64
+
 # num_stages / num_warps are free and re-tuned per architecture by autotune.
+# BLOCK_M/BLOCK_N are structural: the index list addresses keys as
+# ``kv_idx * BLOCK_N``, so both must match the tile size the caller built.
 _CONFIGS = [
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_stages=s, num_warps=w)
+    triton.Config(
+        {"BLOCK_M": BLOCK_SIZE, "BLOCK_N": BLOCK_SIZE}, num_stages=s, num_warps=w
+    )
     for s in (2, 3, 4, 5, 6, 7)
     for w in (4, 8)
 ]
 
 
-@triton.autotune(_CONFIGS, key=["N_CTX_Q", "N_CTX_KV", "HEAD_DIM"])
+@triton.jit
+def _pool_tiles(
+    X,
+    tile_rows,
+    variable_block_sizes,
+    Out,
+    stride_xs,
+    stride_xh,
+    stride_oh,
+    stride_ot,
+    HEAD_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Mean of each tile's live rows, in fp32. One program per (tile, head)."""
+    tile = tl.program_id(0)
+    head = tl.program_id(1)
+    offs = tl.arange(0, BLOCK)
+    offs_d = tl.arange(0, HEAD_DIM)
+    size = tl.load(variable_block_sizes + tile)
+    valid = offs < size
+    rows = tl.load(tile_rows + tile * BLOCK + offs, mask=valid, other=0).to(tl.int64)
+    x = tl.load(
+        X + rows[:, None] * stride_xs + head * stride_xh + offs_d[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(Out + head * stride_oh + tile * stride_ot + offs_d, tl.sum(x, 0) / size)
+
+
+@triton.jit
+def _quantize_tiles(
+    X,
+    tile_rows,
+    variable_block_sizes,
+    Mean,
+    Out,
+    Scale,
+    stride_xs,
+    stride_xh,
+    stride_oh,
+    stride_os,
+    stride_sh,
+    SMOOTH: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Gather one tile, optionally de-mean it, quantize to int8 with one scale.
+
+    Pad slots are written as zero rather than left undefined: they are masked
+    out of the softmax anyway, but a garbage row would otherwise decide the
+    tile's amax and cost every live row its precision.
+    """
+    tile = tl.program_id(0)
+    head = tl.program_id(1)
+    offs = tl.arange(0, BLOCK)
+    offs_d = tl.arange(0, HEAD_DIM)
+    size = tl.load(variable_block_sizes + tile)
+    valid = offs < size
+    rows = tl.load(tile_rows + tile * BLOCK + offs, mask=valid, other=0).to(tl.int64)
+    x = tl.load(
+        X + rows[:, None] * stride_xs + head * stride_xh + offs_d[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    if SMOOTH:
+        mean = tl.load(Mean + head * HEAD_DIM + offs_d)
+        x = tl.where(valid[:, None], x - mean[None, :], 0.0)
+    scale = tl.max(tl.abs(x)) / 127.0
+    scale = tl.where(scale > 0, scale, 1.0)
+    quantized = tl.extra.cuda.libdevice.round(x / scale).to(tl.int8)
+    tl.store(
+        Out
+        + head * stride_oh
+        + (tile * BLOCK + offs)[:, None] * stride_os
+        + offs_d[None, :],
+        quantized,
+    )
+    tl.store(Scale + head * stride_sh + tile, scale)
+
+
+@triton.autotune(_CONFIGS, key=["N_CTX_KV", "HEAD_DIM", "QUANT"])
 @triton.jit
 def _attn_fwd_sparse(
     Q,
     K,
+    K_SCALE,
     V,
+    Out,
     sm_scale,
+    tile_rows,
     q2k_index,
     q2k_num,
     max_kv_blks,
     variable_block_sizes,
-    M,
-    Out,
-    stride_qz,
+    stride_qs,
     stride_qh,
-    stride_qm,
-    stride_qk,
-    stride_kz,
     stride_kh,
-    stride_kn,
-    stride_kk,
-    stride_vz,
+    stride_ks,
+    stride_kd,
+    stride_sh,
+    stride_vs,
     stride_vh,
-    stride_vk,
-    stride_vn,
-    stride_oz,
+    stride_os,
     stride_oh,
-    stride_om,
-    stride_on,
-    Z,
-    H,
-    N_CTX_Q,
     N_CTX_KV,
+    Q_TILE_OFFSET,
+    N_Q_TILES,
+    QUANT: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    q_blk = tl.program_id(0)  # query tile
-    off_hz = tl.program_id(1)  # fused (batch, head)
-    b = off_hz // H
-    h = off_hz % H
-    q_tiles = N_CTX_Q // BLOCK_M
-    meta_base = (b * H + h) * q_tiles + q_blk
-
+    q_blk = tl.program_id(0)
+    head = tl.program_id(1)
+    # The caller runs prefix and video query tiles as separate launches, so the
+    # index metadata is addressed from this launch's first tile while the tile
+    # geometry is addressed absolutely.
+    tile = q_blk + Q_TILE_OFFSET
+    meta_base = head * N_Q_TILES + q_blk
     kv_blocks = tl.load(q2k_num + meta_base)
     kv_ptr = q2k_index + meta_base * max_kv_blks
 
-    # Q and KV can have different lengths, so their per-(batch, head) strides
-    # differ and each base offset is computed on its own.
-    q_off = b.to(tl.int64) * stride_qz + h.to(tl.int64) * stride_qh
-    k_off = b.to(tl.int64) * stride_kz + h.to(tl.int64) * stride_kh
-    v_off = b.to(tl.int64) * stride_vz + h.to(tl.int64) * stride_vh
-    o_off = b.to(tl.int64) * stride_oz + h.to(tl.int64) * stride_oh
-
-    Q_ptr = tl.make_block_ptr(
-        base=Q + q_off,
-        shape=(N_CTX_Q, HEAD_DIM),
-        strides=(stride_qm, stride_qk),
-        offsets=(q_blk * BLOCK_M, 0),
-        block_shape=(BLOCK_M, HEAD_DIM),
-        order=(1, 0),
+    offs = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+    q_size = tl.load(variable_block_sizes + tile)
+    q_valid = offs < q_size
+    q_rows = tl.load(tile_rows + tile * BLOCK_M + offs, mask=q_valid, other=0).to(
+        tl.int64
     )
+    q_ptr = Q + q_rows[:, None] * stride_qs + head * stride_qh + offs_d[None, :]
+    if QUANT:
+        q_f32 = tl.load(q_ptr, mask=q_valid[:, None], other=0.0).to(tl.float32)
+        q_scale = tl.max(tl.abs(q_f32)) / 127.0
+        q_scale = tl.where(q_scale > 0, q_scale, 1.0)
+        q = tl.extra.cuda.libdevice.round(q_f32 / q_scale).to(tl.int8)
+    else:
+        q = tl.load(q_ptr, mask=q_valid[:, None], other=0.0)
+        q_scale = 1.0
+
+    # K is the one tensor laid out in tile order: every query tile reads it,
+    # transposed, so a gather in the inner loop would be paid per (query tile,
+    # key tile) instead of once.
     K_base = tl.make_block_ptr(
-        base=K + k_off,
+        base=K + head.to(tl.int64) * stride_kh,
         shape=(HEAD_DIM, N_CTX_KV),
-        strides=(stride_kk, stride_kn),
+        strides=(stride_kd, stride_ks),
         offsets=(0, 0),
         block_shape=(HEAD_DIM, BLOCK_N),
         order=(0, 1),
     )
-    V_base = tl.make_block_ptr(
-        base=V + v_off,
-        shape=(N_CTX_KV, HEAD_DIM),
-        strides=(stride_vk, stride_vn),
-        offsets=(0, 0),
-        block_shape=(BLOCK_N, HEAD_DIM),
-        order=(1, 0),
-    )
-    O_ptr = tl.make_block_ptr(
-        base=Out + o_off,
-        shape=(N_CTX_Q, HEAD_DIM),
-        strides=(stride_om, stride_on),
-        offsets=(q_blk * BLOCK_M, 0),
-        block_shape=(BLOCK_M, HEAD_DIM),
-        order=(1, 0),
-    )
 
-    offs_m = q_blk * BLOCK_M + tl.arange(0, BLOCK_M)
     m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     qk_scale = sm_scale * 1.44269504  # 1/ln2
-    q = tl.load(Q_ptr)
 
     for i in range(0, kv_blocks):
         kv_idx = tl.load(kv_ptr + i).to(tl.int32)
         block_size = tl.load(variable_block_sizes + kv_idx)
-        K_ptr = tl.advance(K_base, (0, kv_idx * BLOCK_N))
-        V_ptr = tl.advance(V_base, (kv_idx * BLOCK_N, 0))
-
-        k = tl.load(K_ptr)
-        qk = tl.dot(q, k)
+        k = tl.load(tl.advance(K_base, (0, kv_idx * BLOCK_N)))
+        if QUANT:
+            k_scale = tl.load(K_SCALE + head * stride_sh + kv_idx)
+            qk = tl.dot(q, k, out_dtype=tl.int32).to(tl.float32) * (q_scale * k_scale)
+        else:
+            qk = tl.dot(q, k)
         # Columns past the tile's live token count are padding.
-        mask = tl.arange(0, BLOCK_N) < block_size
-        qk = tl.where(mask[None, :], qk, -float("inf"))
+        live = offs_n < block_size
+        qk = tl.where(live[None, :], qk, -float("inf"))
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
         p = tl.math.exp2(qk * qk_scale - m_ij[:, None])
@@ -151,92 +240,156 @@ def _attn_fwd_sparse(
         l_i = l_i * alpha + l_ij
         acc = acc * alpha[:, None]
 
-        v = tl.load(V_ptr)
+        v_rows = tl.load(tile_rows + kv_idx * BLOCK_N + offs_n, mask=live, other=0).to(
+            tl.int64
+        )
+        v = tl.load(
+            V + v_rows[:, None] * stride_vs + head * stride_vh + offs_d[None, :],
+            mask=live[:, None],
+            other=0.0,
+        )
         acc = tl.dot(p.to(tl.bfloat16), v, acc)
         m_i = m_ij
 
-    m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
-    tl.store(M + off_hz * N_CTX_Q + offs_m, m_i)
-    tl.store(O_ptr, acc.to(Out.type.element_ty))
+    tl.store(
+        Out + q_rows[:, None] * stride_os + head * stride_oh + offs_d[None, :],
+        acc.to(Out.type.element_ty),
+        mask=q_valid[:, None],
+    )
 
 
-BLOCK_SIZE = 64
+def pool_tiles(
+    x: torch.Tensor,
+    tile_rows: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+    num_tiles: int,
+) -> torch.Tensor:
+    """Tile means of packed ``[S, H, D]`` rows -> ``[H, num_tiles, D]`` fp32."""
+    heads, dim = x.shape[1], x.shape[2]
+    out = torch.empty((heads, num_tiles, dim), dtype=torch.float32, device=x.device)
+    _pool_tiles[(num_tiles, heads, 1)](
+        x,
+        tile_rows,
+        variable_block_sizes,
+        out,
+        x.stride(0),
+        x.stride(1),
+        out.stride(0),
+        out.stride(1),
+        HEAD_DIM=dim,
+        BLOCK=BLOCK_SIZE,
+    )
+    return out
+
+
+def quantize_tiles(
+    x: torch.Tensor,
+    tile_rows: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+    num_tiles: int,
+    channel_mean: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Packed ``[S, H, D]`` rows -> int8 ``[H, num_tiles * 64, D]`` and scales.
+
+    ``channel_mean`` is K's per-head, per-channel mean over the live rows. It is
+    subtracted before quantizing, which softmax cancels exactly and which is
+    what makes int8 usable on a K with a channel bias.
+    """
+    heads, dim = x.shape[1], x.shape[2]
+    out = torch.empty(
+        (heads, num_tiles * BLOCK_SIZE, dim), dtype=torch.int8, device=x.device
+    )
+    scale = torch.empty((heads, num_tiles), dtype=torch.float32, device=x.device)
+    _quantize_tiles[(num_tiles, heads, 1)](
+        x,
+        tile_rows,
+        variable_block_sizes,
+        x if channel_mean is None else channel_mean,
+        out,
+        scale,
+        x.stride(0),
+        x.stride(1),
+        out.stride(0),
+        out.stride(1),
+        scale.stride(0),
+        SMOOTH=channel_mean is not None,
+        HEAD_DIM=dim,
+        BLOCK=BLOCK_SIZE,
+    )
+    return out, scale
 
 
 def block_sparse_attn_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    query: torch.Tensor,
+    key_tiled: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    tile_rows: torch.Tensor,
     q2k_index: torch.Tensor,
     q2k_num: torch.Tensor,
     variable_block_sizes: torch.Tensor,
+    q_tile_offset: int,
+    key_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Block-sparse attention over 64-token tiles.
+    """Block-sparse attention for one contiguous run of query tiles.
 
-    q: ``[B, H, Tq, D]``, k/v: ``[B, H, Tkv, D]``, both tile-aligned. ``q``
-    may cover a suffix of the query tiles (the caller runs prefix and video
-    query tiles as separate launches); the index metadata is then indexed from
-    that slice's first tile, which is why ``q2k_num`` fixes ``Tq``.
+    ``query``, ``value`` and ``out`` are packed ``[S, H, D]`` rows, addressed
+    through ``tile_rows`` (``[num_tiles * 64]`` int32: the packed row each tiled
+    slot holds, 0 and masked for the pad slots of a partial tile).
+    ``key_tiled`` is ``[H, num_tiles * 64, D]``, bf16 or int8; int8 requires
+    ``key_scale`` ``[H, num_tiles]``.
 
-    ``q2k_index`` is ``[B, H, Tq // 64, W]`` int32 -- for each query tile, the
-    key tiles it attends to, in the first ``q2k_num[b, h, i]`` slots. Entries
-    past the count are never read. ``variable_block_sizes`` is ``[Tkv // 64]``
-    int32, the live token count of every key tile.
+    ``q2k_index`` is ``[H, q_tiles, W]`` int32 -- for each query tile of *this
+    launch*, the key tiles it attends to in the first ``q2k_num[h, i]`` slots.
+    ``q_tile_offset`` is where those tiles start in the absolute tile numbering.
+    Only the rows of the covered tiles are written, so two launches can fill one
+    output.
     """
-    batch, heads, q_len, head_dim = q.shape
-    kv_len = k.shape[2]
-    if q_len % BLOCK_SIZE or kv_len % BLOCK_SIZE:
-        raise ValueError(
-            f"block-sparse attention needs tile-aligned lengths, got q={q_len}, kv={kv_len}"
-        )
-    if q2k_num.shape[-1] != q_len // BLOCK_SIZE:
-        raise ValueError(
-            f"q2k_num covers {q2k_num.shape[-1]} query tiles, q has {q_len // BLOCK_SIZE}"
-        )
+    heads, kv_len, dim = key_tiled.shape
+    q_tiles = q2k_num.shape[-1]
+    quantized = key_tiled.dtype is torch.int8
+    if quantized and key_scale is None:
+        raise ValueError("an int8 key buffer needs its per-tile scales")
+    if kv_len % BLOCK_SIZE:
+        raise ValueError(f"key buffer must be tile-aligned, got {kv_len} rows")
     if variable_block_sizes.numel() != kv_len // BLOCK_SIZE:
         raise ValueError(
             f"variable_block_sizes has {variable_block_sizes.numel()} entries, "
-            f"kv has {kv_len // BLOCK_SIZE} tiles"
+            f"the key buffer has {kv_len // BLOCK_SIZE} tiles"
+        )
+    if q_tile_offset + q_tiles > kv_len // BLOCK_SIZE:
+        raise ValueError(
+            f"query tiles [{q_tile_offset}, {q_tile_offset + q_tiles}) escape the "
+            f"{kv_len // BLOCK_SIZE}-tile sequence"
         )
 
-    out = torch.empty_like(q)
-    # The kernel writes the softmax log-sum-exp unconditionally; nothing here
-    # reads it (there is no backward), but it still needs somewhere to land.
-    lse = torch.empty((batch, heads, q_len), dtype=torch.float32, device=q.device)
-
-    grid = lambda _: (triton.cdiv(q_len, BLOCK_SIZE), batch * heads, 1)  # noqa: E731
-    _attn_fwd_sparse[grid](
-        q,
-        k,
-        v,
-        1.0 / math.sqrt(head_dim),
+    _attn_fwd_sparse[(q_tiles, heads, 1)](
+        query,
+        key_tiled,
+        key_scale if quantized else key_tiled,
+        value,
+        out,
+        1.0 / math.sqrt(dim),
+        tile_rows,
         q2k_index,
         q2k_num,
         q2k_index.shape[-1],
         variable_block_sizes,
-        lse,
-        out,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
+        query.stride(0),
+        query.stride(1),
+        key_tiled.stride(0),
+        key_tiled.stride(1),
+        key_tiled.stride(2),
+        key_scale.stride(0) if quantized else 0,
+        value.stride(0),
+        value.stride(1),
         out.stride(0),
         out.stride(1),
-        out.stride(2),
-        out.stride(3),
-        batch,
-        heads,
-        q_len,
         kv_len,
-        HEAD_DIM=head_dim,
+        q_tile_offset,
+        q_tiles,
+        QUANT=quantized,
+        HEAD_DIM=dim,
     )
     return out

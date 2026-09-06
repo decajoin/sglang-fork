@@ -57,12 +57,14 @@ what the video grid is -- and the pipeline publishes it with
 describe (the token refiner, a model that never published one) runs dense, so
 no layer has to be excluded by hand.
 
-Unlike a dense flash kernel, which streams and costs essentially nothing,
-tiling means padded copies of Q, K and V plus an output buffer and a
-``[heads, tiles, tiles]`` fp32 score matrix. Across 28 rank-local heads at a
-116k-row sequence that is 3.7 GiB, enough to OOM a card the dense path fits on;
-``head_chunk_budget_mib`` sizes the head slice so the transients stay inside a
-budget instead.
+Two things keep it affordable on a card the dense path already fills. Only K is
+laid out in tile order -- Q, V and the output are read and written in place
+through a slot-to-row index, so tiling costs one buffer rather than four -- and
+the head slice is sized from ``head_chunk_budget_mib`` so the remaining
+transients, K and the score matrix that grows with the square of the sequence,
+stay inside a budget instead of scaling with the resolution. Q.K then runs on
+INT8 tensor cores by default, SageAttention-style, which is where most of the
+speed comes from; ``{"quantize": false}`` returns the kernel to bf16.
 """
 
 from __future__ import annotations
@@ -96,6 +98,8 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn i
 from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3 import (
     BLOCK_SIZE,
     block_sparse_attn_forward,
+    pool_tiles,
+    quantize_tiles,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -111,13 +115,11 @@ assert math.prod(VSA_TILE_SIZE) == BLOCK_SIZE
 
 # Fraction of *video* key tiles each video query tile drops. 0.9 is FastVideo's
 # trained policy for the VSA-distilled H3 preview and its reference default.
-# Measured here on one RTX 5090 at H=14, D=128, bf16, against bf16 SDPA on the
-# whole backend call -- tiling, selection, the dense prefix launch and the
-# gather included: 36k rows 2.95x at 0.9 and 3.72x at 0.95; 71k rows 3.8x and
-# 5.1x. The block-sparse kernel alone is 7.4x / 13.4x at those sparsities; the
-# difference is what protecting the prefix costs, and it is the honest number.
-# All of it is op-level -- attention is only part of a denoise step, so the
-# end-to-end gain is smaller again.
+# Measured here on one RTX 5090 against bf16 SDPA over the whole backend call
+# -- selection, the dense prefix launch and the gather included -- with INT8
+# Q.K on: 36k rows and 14 heads 4.99x at 0.9 and 6.24x at 0.95; 116k rows and
+# 28 heads 7.58x and 11.07x. Op-level numbers: attention is only part of a
+# denoise step, so the end-to-end gain is smaller.
 DEFAULT_SPARSITY = 0.9
 # Leading denoise forwards kept dense. The early steps settle the layout of the
 # sample and tolerate approximation badly. 10 of 50 is what subblock_sparse
@@ -162,6 +164,14 @@ DEFAULT_HEAD_CHUNK = 0
 # card has room, and remember it bounds the *transients* -- the packed inputs
 # and the output are the caller's and are not counted here.
 DEFAULT_HEAD_CHUNK_BUDGET_MIB = 512
+# Whether Q.K runs on INT8 tensor cores, SageAttention-style: K is quantized per
+# tile with its per-channel mean removed first (which softmax cancels exactly),
+# Q per tile in registers, and P.V stays bf16. Measured on one RTX 5090 at 36k
+# and 116k rows: 1.85x and 1.94x on the attention op, for 1.3% of the output's
+# norm in added error -- SageAttention's own budget, and the same error the
+# dense fallback this backend already falls back to carries. Turn it off to
+# separate a quality question from the sparsity, which is the much larger term.
+DEFAULT_QUANTIZE = True
 # Whether prefix keys are exempt from the budget or compete inside it.
 DEFAULT_PREFIX_MODE = "exempt"
 _PREFIX_MODES = ("exempt", "compete")
@@ -246,6 +256,8 @@ class _TileGeometry:
     variable_block_sizes: torch.Tensor  # [n_tiles] int32, live tokens per tile
     scatter_index: torch.Tensor  # [live_rows] int64, packed row -> padded slot
     pad_index: torch.Tensor  # [padded_rows - live_rows] int64, the slots left over
+    tile_rows: torch.Tensor  # [padded_rows] int32, the packed row each slot holds
+
     num_prefix_tiles: int
     num_video_tiles: int
 
@@ -315,10 +327,19 @@ def _tile_geometry(
     is_live[non_pad_index] = True
     pad_index = torch.nonzero(~is_live, as_tuple=False).view(-1)
 
+    # The inverse of ``scatter_index``, and the only one of the two the kernels
+    # use: they read and write the packed rows in place and address them by
+    # tiled slot. Pad slots hold 0 and are masked, so the value is never read.
+    tile_rows = torch.zeros(padded_rows, dtype=torch.int32, device=device)
+    tile_rows[scatter_index] = torch.arange(
+        scatter_index.numel(), dtype=torch.int32, device=device
+    )
+
     geometry = _TileGeometry(
         variable_block_sizes=variable_block_sizes,
         scatter_index=scatter_index,
         pad_index=pad_index,
+        tile_rows=tile_rows,
         num_prefix_tiles=len(prefix_sizes),
         num_video_tiles=int(video_sizes.numel()),
     )
@@ -428,6 +449,7 @@ class VsaH3Schedule(msgspec.Struct, frozen=True):
     min_seq_len: int
     head_chunk: int
     head_chunk_budget_mib: int
+    quantize: bool
 
     @classmethod
     def from_server_args(cls) -> "VsaH3Schedule":
@@ -457,6 +479,7 @@ class VsaH3Schedule(msgspec.Struct, frozen=True):
             head_chunk_budget_mib=int(
                 config.get("head_chunk_budget_mib", DEFAULT_HEAD_CHUNK_BUDGET_MIB)
             ),
+            quantize=bool(config.get("quantize", DEFAULT_QUANTIZE)),
         )
         # sparsity == 0 keeps every tile and is the calibration setting the
         # tests use against dense attention, so it has to stay legal; 1.0 would
@@ -688,20 +711,36 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
     ) -> int:
         """Heads per pass, from the configured budget when none was given.
 
-        What a pass costs, per head: four ``padded_rows x head_dim`` tile
-        buffers (Q, K, V and the output) plus one ``tiles x tiles`` fp32 score
-        matrix. Both terms grow with the sequence, and the second grows with
-        its square, so a fixed head count that is right at 36k rows is wrong at
-        116k. Sizing the slice from bytes instead keeps the transients flat
-        across resolutions, which is what stops a long request from OOMing a
-        card the dense path fits on.
+        What a pass costs, per head: the key buffer laid out in tile order (one
+        byte per element quantized, two otherwise), the two pooled tile means,
+        the ``tiles x tiles`` fp32 score matrix and the index list the selection
+        produces. Q, V and the output are the caller's tensors, read and written
+        in place, and cost nothing here.
+
+        The score matrix grows with the square of the sequence, so a fixed head
+        count that is right at 36k rows is wrong at 116k. Sizing the slice from
+        bytes instead keeps the transients flat across resolutions, which is
+        what stops a long request from OOMing a card the dense path fits on.
         """
         explicit = self.schedule.head_chunk
         if explicit > 0:
             return explicit
+        key_bytes = 1 if self.schedule.quantize else itemsize
+        tiles, video_tiles = geometry.num_tiles, geometry.num_video_tiles
+        topk = compute_topk(self.schedule.sparsity, video_tiles)
+        compete = self.schedule.prefix_mode == "compete"
+        # Only video query tiles are scored, against video keys alone unless
+        # the prefix competes; top-k then holds fp32 values and int64 indices
+        # over the chosen width, an int32 copy of those indices, and the list
+        # the kernel is finally handed.
+        score_columns = tiles if compete else video_tiles
+        chosen = min(topk + tiles, tiles) if compete else topk
         per_head = (
-            4 * geometry.padded_rows * self.head_size * itemsize
-            + geometry.num_tiles * geometry.num_tiles * 4
+            geometry.padded_rows * self.head_size * key_bytes  # tiled K
+            + 2 * tiles * self.head_size * 4  # the two pooled tile means
+            + video_tiles * score_columns * 4  # the score matrix
+            + video_tiles * chosen * 16  # top-k's values, indices and copies
+            + video_tiles * (chosen + geometry.num_prefix_tiles) * 4  # the list
         )
         budget = self.schedule.head_chunk_budget_mib * 1024 * 1024
         return max(1, min(heads, budget // max(per_head, 1)))
@@ -713,49 +752,62 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         for start in range(0, heads, chunk):
             yield start, min(start + chunk, heads)
 
-    def _tile(self, x: torch.Tensor, geometry: _TileGeometry) -> torch.Tensor:
-        """``[S, H, D]`` live rows -> ``[1, H, padded_rows, D]`` tile buffer.
+    def _tile_key(self, key: torch.Tensor, geometry: _TileGeometry) -> torch.Tensor:
+        """``[S, H, D]`` live rows -> ``[H, padded_rows, D]``, in tile order.
 
-        Pad slots stay zero. They are never read as queries (their output rows
-        are dropped on the way back) and never read as keys (the kernel masks
-        every column past a tile's live size), so their contents only have to
-        be finite.
+        K is the one tensor worth materialising: every query tile reads all of
+        it, transposed, so gathering it in the inner loop would pay the gather
+        per (query tile, key tile) instead of once. Q, V and the output are read
+        and written in place through ``tile_rows``.
+
+        Pad slots are zeroed, not left undefined -- they are masked out of the
+        softmax, but a garbage row still has to be finite. Only the leftovers of
+        partial tiles need clearing, a few thousand rows against the whole
+        buffer, so the allocation itself is uninitialised.
         """
-        heads, dim = x.shape[-2], x.shape[-1]
+        heads, dim = key.shape[-2], key.shape[-1]
         buffer = torch.empty(
-            (heads, geometry.padded_rows, dim), dtype=x.dtype, device=x.device
+            (heads, geometry.padded_rows, dim), dtype=key.dtype, device=key.device
         )
-        # Every live slot is written below, so only the leftovers of partial
-        # tiles need clearing -- a few thousand rows against the whole buffer.
         buffer[:, geometry.pad_index] = 0
-        buffer[:, geometry.scatter_index] = x.transpose(0, 1)
-        return buffer.unsqueeze(0)
+        buffer[:, geometry.scatter_index] = key.transpose(0, 1)
+        return buffer
 
     def _q2k_for_video(
         self,
-        scores: torch.Tensor,
+        q_pooled: torch.Tensor,
+        k_pooled: torch.Tensor,
         geometry: _TileGeometry,
         topk: int,
     ) -> torch.Tensor:
-        """Key tiles each video query tile attends to: ``[1, H, n_video, W]``.
+        """Key tiles each video query tile attends to: ``[H, n_video, W]``.
 
-        ``scores`` is the pooled-Q.K matrix for this head slice, restricted to
-        video query tiles. In ``exempt`` mode the budget is spent on video keys
-        alone and every prefix key is appended; in ``compete`` mode the same
-        total number of tiles is chosen from the whole row, so the two modes
-        run the same number of tiles through the kernel.
+        The pooled tile means come in whole; the scores are formed only for the
+        rows and columns the selection can actually choose from. In ``exempt``
+        mode that is video-by-video -- prefix keys are kept unconditionally and
+        prefix queries are dense, so neither needs a score at all, and skipping
+        them keeps the largest transient here to ``n_video ** 2``. In ``compete``
+        mode prefix keys enter the same budget, so the columns come back.
+
+        The softmax scale is left out: it is a positive constant and top-k only
+        ranks, so applying it would cost a second score-sized tensor to change
+        nothing.
         """
-        heads, num_video = scores.shape[1], scores.shape[2]
         prefix = geometry.num_prefix_tiles
+        q_video = q_pooled[:, prefix:]
         if self.schedule.prefix_mode == "compete":
             budget = min(topk + prefix, geometry.num_tiles)
-            return scores.topk(budget, dim=-1).indices.to(torch.int32)
-        video = scores[..., prefix:].topk(topk, dim=-1).indices.to(torch.int32) + prefix
+            scores = torch.matmul(q_video, k_pooled.transpose(-2, -1))
+            return scores.topk(budget, dim=-1).indices.to(torch.int32).contiguous()
+
+        scores = torch.matmul(q_video, k_pooled[:, prefix:].transpose(-2, -1))
+        video = scores.topk(topk, dim=-1).indices.to(torch.int32) + prefix
+        del scores
         if prefix == 0:
             return video.contiguous()
         prefix_cols = torch.arange(
-            prefix, device=scores.device, dtype=torch.int32
-        ).expand(1, heads, num_video, prefix)
+            prefix, device=video.device, dtype=torch.int32
+        ).expand(video.shape[0], video.shape[1], prefix)
         return torch.cat([prefix_cols, video], dim=-1)
 
     def _sparse_attention(
@@ -767,89 +819,109 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
     ) -> torch.Tensor:
         """Live ``[S, H, D]`` rows -> same shape, attention over tiles.
 
-        Two launches of the same kernel rather than one: prefix query tiles
-        take every key tile and video query tiles take their selection, so
-        splitting them keeps the index list as narrow as the selection instead
-        of as wide as the sequence. The kernel indexes its metadata from the
-        first query tile it is given, which is what makes the second launch a
-        plain suffix slice.
+        Two launches of the same kernel rather than one: prefix query tiles take
+        every key tile and video query tiles take their selection, so splitting
+        them keeps the index list as narrow as the selection instead of as wide
+        as the sequence. Both write into one output, each covering the rows of
+        the tiles it was given.
 
-        Everything inside the head loop -- the tile buffers included -- is
-        sliced by head, so ``head_chunk`` bounds the transients rather than
-        just the score matrix. The gathered output goes straight into the
-        packed result, so no full-width tile buffer outlives a slice.
+        Head slices are views, not copies -- every kernel here takes explicit
+        strides -- so slicing costs nothing but the launches it adds.
         """
         heads = query.shape[-2]
-        prefix_rows = geometry.num_prefix_tiles * BLOCK_SIZE
         sizes = geometry.variable_block_sizes
+        tile_rows = geometry.tile_rows
+        tiles, prefix_tiles = geometry.num_tiles, geometry.num_prefix_tiles
         topk = compute_topk(self.schedule.sparsity, geometry.num_video_tiles)
+        quantize = self.schedule.quantize
         out = torch.empty_like(query)
         chunk = self._head_chunk_for(geometry, heads, query.element_size())
 
         logger.info_once(
-            f"VSA-H3 attention active: {geometry.num_tiles} tiles "
-            f"({geometry.num_prefix_tiles} prefix + {geometry.num_video_tiles} "
-            f"video), keeping {topk}/{geometry.num_video_tiles} video tiles per "
-            f"video query tile, heads={heads} in slices of {chunk}"
+            f"VSA-H3 attention active: {tiles} tiles ({prefix_tiles} prefix + "
+            f"{geometry.num_video_tiles} video), keeping {topk}/"
+            f"{geometry.num_video_tiles} video tiles per video query tile, "
+            f"{'INT8 Q.K' if quantize else 'bf16 Q.K'}, heads={heads} in slices "
+            f"of {chunk}"
         )
 
         for start, stop in self._head_slices(heads, chunk):
-            width = stop - start
-            q_tiled = self._tile(query[:, start:stop], geometry)
-            k_tiled = self._tile(key[:, start:stop], geometry)
-            v_tiled = self._tile(value[:, start:stop], geometry)
-            out_tiled = torch.empty_like(q_tiled)
+            q_slice = query[:, start:stop]
+            k_slice = key[:, start:stop]
+            v_slice = value[:, start:stop]
+            out_slice = out[:, start:stop]
 
-            if geometry.num_prefix_tiles:
-                # Prefix queries are dense: every key tile, in order.
-                dense_index = (
-                    torch.arange(
-                        geometry.num_tiles, device=query.device, dtype=torch.int32
-                    )
-                    .expand(1, width, geometry.num_prefix_tiles, geometry.num_tiles)
-                    .contiguous()
-                )
-                dense_num = torch.full(
-                    (1, width, geometry.num_prefix_tiles),
-                    geometry.num_tiles,
-                    device=query.device,
-                    dtype=torch.int32,
-                )
-                out_tiled[:, :, :prefix_rows] = block_sparse_attn_forward(
-                    q_tiled[:, :, :prefix_rows],
-                    k_tiled,
-                    v_tiled,
-                    dense_index,
-                    dense_num,
+            key_scale = None
+            if quantize:
+                # K's per-channel mean over the live rows. Subtracting it before
+                # quantizing shifts every logit in a row by the same -q.km,
+                # which softmax cancels exactly, and it is what keeps the int8
+                # range on the part of K that varies.
+                key_tiled, key_scale = quantize_tiles(
+                    k_slice,
+                    tile_rows,
                     sizes,
+                    tiles,
+                    k_slice.mean(dim=0, dtype=torch.float32).contiguous(),
                 )
-                del dense_index, dense_num
+            else:
+                key_tiled = self._tile_key(k_slice, geometry)
 
-            scores = _pooled_scores(q_tiled, k_tiled, sizes)
+            # Selection runs on the unquantized rows: it only has to rank tiles,
+            # and pooling is a mean over 64 rows, so it is cheap either way.
             q2k_index = self._q2k_for_video(
-                scores[:, :, geometry.num_prefix_tiles :], geometry, topk
+                pool_tiles(q_slice, tile_rows, sizes, tiles),
+                pool_tiles(k_slice, tile_rows, sizes, tiles),
+                geometry,
+                topk,
             )
-            # The score matrix is the largest transient here; let it go before
-            # the kernel allocates.
-            del scores
             q2k_num = torch.full(
-                (1, width, geometry.num_video_tiles),
+                (stop - start, geometry.num_video_tiles),
                 q2k_index.shape[-1],
                 device=query.device,
                 dtype=torch.int32,
             )
-            out_tiled[:, :, prefix_rows:] = block_sparse_attn_forward(
-                q_tiled[:, :, prefix_rows:],
-                k_tiled,
-                v_tiled,
-                q2k_index.contiguous(),
+
+            if prefix_tiles:
+                # Prefix queries are dense: every key tile, in order.
+                dense_index = (
+                    torch.arange(tiles, device=query.device, dtype=torch.int32)
+                    .expand(stop - start, prefix_tiles, tiles)
+                    .contiguous()
+                )
+                dense_num = torch.full(
+                    (stop - start, prefix_tiles),
+                    tiles,
+                    device=query.device,
+                    dtype=torch.int32,
+                )
+                block_sparse_attn_forward(
+                    q_slice,
+                    key_tiled,
+                    v_slice,
+                    out_slice,
+                    tile_rows,
+                    dense_index,
+                    dense_num,
+                    sizes,
+                    0,
+                    key_scale,
+                )
+                del dense_index, dense_num
+
+            block_sparse_attn_forward(
+                q_slice,
+                key_tiled,
+                v_slice,
+                out_slice,
+                tile_rows,
+                q2k_index,
                 q2k_num,
                 sizes,
+                prefix_tiles,
+                key_scale,
             )
-            del q2k_index, q2k_num, q_tiled, k_tiled, v_tiled
-
-            out[:, start:stop] = out_tiled[0][:, geometry.scatter_index].transpose(0, 1)
-            del out_tiled
+            del q2k_index, q2k_num, key_tiled, key_scale
 
         return out
 
@@ -935,27 +1007,6 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         out = torch.zeros_like(query)
         out[:used] = live_out
         return out
-
-
-def _pooled_scores(
-    query: torch.Tensor, key: torch.Tensor, variable_block_sizes: torch.Tensor
-) -> torch.Tensor:
-    """Tile-mean Q.K scores: ``[1, H, S, D]`` tile buffers -> ``[1, H, n, n]``.
-
-    fp32 throughout, and the mean is exact: pad slots are zero and were never
-    written, so a plain sum divided by the tile's live size is the masked mean
-    without a mask or an fp32 copy of the inputs.
-    """
-    heads, padded_rows, dim = query.shape[1], query.shape[2], query.shape[3]
-    tiles = padded_rows // BLOCK_SIZE
-    sizes = variable_block_sizes.view(1, 1, -1, 1)
-    q_pooled = query.view(1, heads, tiles, BLOCK_SIZE, dim).sum(
-        dim=3, dtype=torch.float32
-    ) / sizes.to(torch.float32)
-    k_pooled = key.view(1, heads, tiles, BLOCK_SIZE, dim).sum(
-        dim=3, dtype=torch.float32
-    ) / sizes.to(torch.float32)
-    return torch.matmul(q_pooled, k_pooled.transpose(-2, -1)) / math.sqrt(dim)
 
 
 __all__ = [
