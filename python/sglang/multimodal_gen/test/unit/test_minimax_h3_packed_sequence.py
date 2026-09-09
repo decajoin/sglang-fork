@@ -129,6 +129,59 @@ class TestMiniMaxH3PackedSequence(unittest.TestCase):
         self.assertEqual(int((~built["audio_update_mask"]).sum()), 582 * 2)
         self.assertEqual(built["token_tags"][built["audio_pos"]].unique().tolist(), [2])
 
+    def test_ref2va_tags_every_picture_segment_with_its_grid(self):
+        """Tile-based sparse attention needs each reference block's grid."""
+        built = minimax_h3_packed_sequence_ref2va_blocks(
+            text_len=5,
+            latent_t=2,
+            latent_h=4,
+            latent_w=4,
+            audio_t=5,
+            ref_blocks=[
+                {"kind": "image", "latent_h": 8, "latent_w": 12},
+                {
+                    "kind": "video_audio",
+                    "ref_audio_t": 3,
+                    "latent_t": 2,
+                    "latent_h": 4,
+                    "latent_w": 6,
+                },
+                {"kind": "audio", "ref_audio_t": 1},
+            ],
+        )
+        segments = built["prefix_segments"]
+        # text | still | ref audio | ref frames | ref audio | target audio
+        self.assertEqual(segments, (5, 24, 6, 12, 2, 10))
+        self.assertEqual(built["reference_visuals"], ((1, (1, 4, 6)), (3, (2, 2, 3))))
+        self.assertEqual(built["video_grid"], (2, 2, 2))
+        for index, grid in built["reference_visuals"]:
+            self.assertEqual(grid[0] * grid[1] * grid[2], segments[index])
+
+    def test_ref2va_empty_segments_do_not_shift_the_picture_tags(self):
+        """A video reference with no audio drops a segment; tags must follow."""
+        built = minimax_h3_packed_sequence_ref2va_blocks(
+            text_len=5,
+            latent_t=2,
+            latent_h=4,
+            latent_w=4,
+            audio_t=5,
+            ref_blocks=[
+                {
+                    "kind": "video",
+                    "ref_audio_t": 0,
+                    "latent_t": 2,
+                    "latent_h": 4,
+                    "latent_w": 6,
+                },
+            ],
+        )
+        segments = built["prefix_segments"]
+        # text | ref frames | target audio -- the empty ref-audio segment is gone
+        self.assertEqual(segments, (5, 12, 10))
+        self.assertEqual(built["reference_visuals"], ((1, (2, 2, 3)),))
+        for index, grid in built["reference_visuals"]:
+            self.assertEqual(grid[0] * grid[1] * grid[2], segments[index])
+
     def test_ref2va_mixed_media_preserves_temporal_origin(self):
         built = minimax_h3_packed_sequence_ref2va_blocks(
             text_len=5,

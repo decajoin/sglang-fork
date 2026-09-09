@@ -493,16 +493,48 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     # Prefix rows in packed order: the prompt, then each reference block as it
     # was laid out above (a video-bearing block packs its audio before its
     # visual rows), then the target audio. Same contract as the t2va builder.
-    prefix_segments: list[int] = [text_len]
+    #
+    # `reference_visuals` tags the segments that are pictures with their patch
+    # grid, so tile-based sparse attention can cut them the way it cuts the
+    # generated video instead of protecting rows that, for a video reference,
+    # are a third of the sequence. Empty segments are dropped as they are
+    # appended rather than filtered afterwards, because those tags index into
+    # the segments that survive.
+    prefix_segments: list[int] = []
+    reference_visuals: list[tuple[int, tuple[int, int, int]]] = []
+
+    def add_segment(rows: int, grid: tuple[int, int, int] | None = None) -> None:
+        if not rows:
+            return
+        if grid is not None:
+            reference_visuals.append((len(prefix_segments), grid))
+        prefix_segments.append(rows)
+
+    add_segment(text_len)
     for item in block_slices:
-        if str(item["kind"]) == "image":
-            prefix_segments.append(int(item["rows"]))
-        elif str(item["kind"]) == "audio":
-            prefix_segments.append(int(item["audio_rows"]))
+        kind = str(item["kind"])
+        if kind == "image":
+            add_segment(
+                int(item["rows"]),
+                (
+                    1,
+                    int(item["latent_h"]) // _PATCH_H,
+                    int(item["latent_w"]) // _PATCH_W,
+                ),
+            )
+        elif kind == "audio":
+            add_segment(int(item["audio_rows"]))
         else:
-            prefix_segments.append(int(item["audio_rows"]))
-            prefix_segments.append(int(item["video_rows"]))
-    prefix_segments.append(audio_rows)
+            add_segment(int(item["audio_rows"]))
+            add_segment(
+                int(item["video_rows"]),
+                (
+                    int(item["latent_t"]),
+                    int(item["latent_h"]) // _PATCH_H,
+                    int(item["latent_w"]) // _PATCH_W,
+                ),
+            )
+    add_segment(audio_rows)
 
     cu = torch.tensor([0, used, seq_len], dtype=torch.int32)
     return {
@@ -515,7 +547,8 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         "img_position_ids": g,
         "token_tags": token_tags,
         "cu_seqlens": cu,
-        "prefix_segments": tuple(rows for rows in prefix_segments if rows),
+        "prefix_segments": tuple(prefix_segments),
+        "reference_visuals": tuple(reference_visuals),
         "video_grid": (latent_t, ph, pw),
     }
 

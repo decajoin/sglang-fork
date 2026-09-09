@@ -92,10 +92,18 @@ def _vsa_h3_geometry_publisher():
             grid = packed.get("video_grid")
             if segments is None or grid is None:
                 return nullcontext()
+            # A builder that tags none of its prefix segments as pictures (the
+            # fl2va layout) publishes no grids, and the backend protects the
+            # whole prefix as it did before.
+            references = packed.get("reference_visuals") or ()
             return vsa_h3_sequence_geometry(
                 VsaH3SequenceGeometry(
                     prefix_segments=tuple(int(rows) for rows in segments),
                     video_grid=tuple(int(axis) for axis in grid),
+                    reference_visuals=tuple(
+                        (int(index), tuple(int(axis) for axis in block_grid))
+                        for index, block_grid in references
+                    ),
                 )
             )
 

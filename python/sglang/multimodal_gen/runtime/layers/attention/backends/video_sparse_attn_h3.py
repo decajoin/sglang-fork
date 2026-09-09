@@ -8,22 +8,34 @@ attention contract. H3 runs one joint bidirectional attention over
 this backend differs from the Wan-tuned ``video_sparse_attn`` in what it tiles
 and what it protects:
 
-- The unit is a 64-token tile. Video rows are tiled in 3D as ``(4, 4, 4)`` over
-  the ``(T, H, W)`` patch grid, so one tile is a small space-time cube whose
-  tokens actually attend to each other. Everything before the video block is
-  tiled into segment-pure 64-row chunks -- a tile never straddles a modality
-  boundary, because a tile is both the unit of selection and the unit of
-  pooling, and pooling text with audio produces a score that describes neither.
+- The unit is a 64-token tile. Every *picture* -- each reference image, each
+  reference video, and the generated video -- is tiled in 3D as ``(4, 4, 4)``
+  over its own ``(T, H, W)`` patch grid, so one tile is a small space-time cube
+  whose tokens actually attend to each other; a block with too few frames to
+  fill that cube is cut one frame deep instead, so a reference still does not
+  spend three quarters of every tile on padding (``_tile_shape_for``). Text and
+  audio are tiled into segment-pure 64-row chunks -- a tile never straddles a
+  modality boundary, because a tile is both the unit of selection and the unit
+  of pooling, and pooling text with audio produces a score that describes
+  neither.
 - Selection is per (head, query tile): pooled Q.K over tiles, then the top
-  ``(1 - sparsity)`` fraction of *video* key tiles. Prefix keys (text, audio,
-  reference rows) are kept by every query -- they are a few percent of the
-  sequence and lose every budget contest they enter, which is what
-  ``sparge_attn`` protects text and audio for and what it saw corrupt audio
-  when it did not. ``{"prefix_mode": "compete"}`` makes them compete under a
-  FLOP-matched budget instead; it is the ablation, not the default.
-- Prefix *queries* are always dense. They are a small minority of the rows, so
-  the FLOPs saved by sparsifying them are noise against the risk to prompt
-  adherence and audio.
+  ``(1 - sparsity)`` fraction of *picture* key tiles. Text and audio keys are
+  kept by every query -- they are a few percent of the sequence and lose every
+  budget contest they enter, which is what ``sparge_attn`` protects them for
+  and what it saw corrupt audio when it did not. ``{"prefix_mode": "compete"}``
+  makes them compete under a FLOP-matched budget instead; it is the ablation,
+  not the default.
+- Reference pictures are *not* protected: they are tiled and ranked alongside
+  the generated video, and their queries sparsify with it. Protecting them is
+  what this backend shipped with, and it is affordable only while they are a
+  few percent of the sequence -- a ref2va request conditioned on a reference
+  video packs 30-40% of its rows there, which capped the achievable speedup at
+  1.57x and measured 1.68x *slower* than ``sparge_attn``, which sparsifies the
+  same rows. ``DEFAULT_SPARSIFY_REFERENCES`` carries the measurement and
+  ``{"sparsify_references": false}`` restores the protected behaviour.
+- Text and audio *queries* are always dense. They are a small minority of the
+  rows, so the FLOPs saved by sparsifying them are noise against the risk to
+  prompt adherence and audio.
 
 The gate-compress branch of upstream VSA is not ported: it needs a trained
 ``to_gate_compress`` matrix per layer, which no MiniMax-H3 checkpoint this tree
@@ -93,7 +105,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.denoise_schedule im
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (
     VSA_TILE_SIZE,
-    construct_variable_block_sizes,
     get_non_pad_index,
     get_tile_partition_indices,
 )
@@ -114,6 +125,16 @@ logger = init_logger(__name__)
 # tile shape that disagreed with the kernel's block size would silently mistile
 # the sequence.
 assert math.prod(VSA_TILE_SIZE) == BLOCK_SIZE
+
+# The tile a visual block with fewer than ``VSA_TILE_SIZE[0]`` latent frames is
+# cut into: one frame deep, and square enough in H/W to still hold 64 tokens.
+# A reference image is a single latent frame, and cutting a still on the
+# 4-frame cube yields tiles of 16 live rows in a 64-row slot -- four times the
+# tiles, three quarters of every slot wasted, and a score matrix that grows
+# with the square of that tile count. Per frame keeps a tile full and keeps its
+# rows spatially adjacent, which is what the pooled score describes.
+_FRAME_TILE_SIZE = (1, 8, 8)
+assert math.prod(_FRAME_TILE_SIZE) == BLOCK_SIZE
 
 # Fraction of *video* key tiles each video query tile drops. 0.9 is FastVideo's
 # trained policy for the VSA-distilled H3 preview and its reference default.
@@ -195,6 +216,28 @@ FP8_MAX = 448.0
 # Whether prefix keys are exempt from the budget or compete inside it.
 DEFAULT_PREFIX_MODE = "exempt"
 _PREFIX_MODES = ("exempt", "compete")
+# Whether reference pictures -- reference images and reference videos -- are
+# tiled and sparsified like the generated video, or protected as prefix.
+#
+# On by default because protecting them is only affordable while they are
+# small, and in ref2va they are not. The prefix-protection rule was written for
+# text and audio, which are a few percent of the sequence; a ref2va request
+# conditioned on a reference *video* packs 30-40% of its rows into that
+# protected block, and protecting them costs more than the sparsity saves:
+# measured over the 51-case official-prompt suite at sparsity 0.9, protected
+# reference rows left video-by-video attention as 3.6% of the dense FLOPs while
+# the protected block alone accounted for 64%, capping the achievable speedup
+# at 1.57x and landing 1.68x *slower* than sparge_attn, which sparsifies the
+# same rows. Sparsifying them restores the budget to what a picture-dominated
+# sequence should get.
+#
+# This is a quality trade, not a free win: a reference tile a query does not
+# select is a reference detail that query cannot see. sparge_attn has run this
+# way on this model and the renders are usable, which is the evidence this
+# default rests on -- measure a render before trusting it on a new checkpoint,
+# and set ``{"sparsify_references": false}`` to get the protected behaviour
+# back for the comparison.
+DEFAULT_SPARSIFY_REFERENCES = True
 
 
 @dataclass(frozen=True)
@@ -209,10 +252,20 @@ class VsaH3SequenceGeometry:
 
     Row counts, not row indices: the geometry is what makes the packed sequence
     tileable, and it is identical for every layer and every step of a request.
+
+    ``reference_visuals`` names which of those prefix segments are *pictures* --
+    ``(segment index, (T, H, W) patch grid)`` for each reference image or
+    reference video, whose rows the packed layout puts before the generated
+    video. A named segment is tiled and sparsified like the generated video
+    instead of being protected as prefix; see ``sparsify_references``. Segments
+    it does not name (the prompt, every audio block) stay protected. Leaving it
+    empty is the pre-existing behaviour and is what a builder that publishes no
+    grids gets.
     """
 
     prefix_segments: tuple[int, ...]
     video_grid: tuple[int, int, int]
+    reference_visuals: tuple[tuple[int, tuple[int, int, int]], ...] = ()
 
     @property
     def prefix_rows(self) -> int:
@@ -265,8 +318,36 @@ def _dit_layer_index(prefix: str) -> int | None:
 
 
 def compute_topk(sparsity: float, num_tiles: int) -> int:
-    """Video key tiles kept per query tile, clamped to [1, num_tiles]."""
+    """Visual key tiles kept per query tile, clamped to [1, num_tiles]."""
     return max(1, min(math.ceil((1 - sparsity) * num_tiles), num_tiles))
+
+
+def _tile_shape_for(grid: tuple[int, int, int]) -> tuple[int, int, int]:
+    """The 3D tile a visual block of shape ``grid`` is cut into."""
+    return VSA_TILE_SIZE if grid[0] >= VSA_TILE_SIZE[0] else _FRAME_TILE_SIZE
+
+
+def _block_sizes(
+    grid: tuple[int, int, int],
+    tile_shape: tuple[int, int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Live tokens per tile for one visual block, in ``(t, h, w)`` tile order.
+
+    ``construct_variable_block_sizes`` answers the same question but reads the
+    tile shape from the module-level ``VSA_TILE_SIZE`` rather than its
+    argument, so it cannot describe a block cut per frame. The order matches
+    ``get_tile_partition_indices``: t-major, then h, then w.
+    """
+    sizes: torch.Tensor | None = None
+    for length, tile in zip(grid, tile_shape):
+        count = math.ceil(length / tile)
+        axis = torch.full((count,), tile, dtype=torch.int32, device=device)
+        remainder = length - (count - 1) * tile
+        axis[-1] = remainder if remainder > 0 else tile
+        sizes = axis if sizes is None else (sizes[:, None] * axis[None, :]).reshape(-1)
+    assert sizes is not None  # a grid is always three axes
+    return sizes
 
 
 @dataclass(frozen=True)
@@ -295,37 +376,86 @@ def _tile_geometry(
     prefix_segments: tuple[int, ...],
     video_grid: tuple[int, int, int],
     device: torch.device,
+    reference_visuals: tuple[tuple[int, tuple[int, int, int]], ...] = (),
 ) -> _TileGeometry:
-    """Tile the packed sequence: segment-pure prefix chunks, then video cubes.
+    """Tile the packed sequence: protected chunks first, then picture tiles.
+
+    Two kinds of tile, in this order:
+
+    - *Prefix* tiles hold the rows that stay protected -- the prompt and every
+      audio block -- cut into segment-pure 64-row chunks. A tile never
+      straddles a modality boundary, because a tile is both the unit of
+      selection and the unit of pooling, and pooling text with audio produces a
+      score that describes neither.
+    - *Video* tiles hold every picture: each reference image and reference
+      video named by ``reference_visuals``, then the generated video, each cut
+      on its own patch grid by ``_tile_shape_for``.
+
+    Tile order is this function's to choose -- the kernels reach rows through
+    ``tile_rows``, never by packed position -- so a reference block's rows sit
+    in the middle of the packed sequence while its tiles sit among the video
+    tiles at the end. That is what lets one selection budget rank reference
+    tiles against generated ones without the kernel knowing the difference,
+    and it is why "prefix" stays the right word for the protected tiles: they
+    are a prefix of the *tile* space even when their rows are not.
 
     Cached on the geometry because it is request-static: 50 layers times N
     denoise steps reuse one set of index tensors.
     """
+    grids = dict(reference_visuals)
+    unknown = sorted(set(grids) - set(range(len(prefix_segments))))
+    if unknown:
+        raise ValueError(
+            f"VSA-H3 reference_visuals names segments {unknown}, which are not "
+            f"in a {len(prefix_segments)}-segment prefix {prefix_segments}"
+        )
+
+    # Split the prefix into the rows that stay protected and the pictures that
+    # join the selection, carrying each one's start so its tiles can address
+    # rows that are no longer a contiguous run.
+    protected: list[tuple[int, int]] = []
+    pictures: list[tuple[int, tuple[int, int, int]]] = []
+    cursor = 0
+    for index, segment in enumerate(prefix_segments):
+        grid = grids.get(index)
+        if grid is None:
+            protected.append((cursor, segment))
+        else:
+            if math.prod(grid) != segment:
+                raise ValueError(
+                    f"VSA-H3 reference_visuals[{index}] grid {grid} covers "
+                    f"{math.prod(grid)} rows but prefix segment {index} has "
+                    f"{segment}"
+                )
+            pictures.append((cursor, grid))
+        cursor += segment
+    prefix_rows = cursor
+    pictures.append((prefix_rows, video_grid))
+
     prefix_sizes: list[int] = []
-    for segment in prefix_segments:
-        full, remainder = divmod(segment, BLOCK_SIZE)
+    prefix_parts: list[torch.Tensor] = []
+    for start, rows in protected:
+        full, remainder = divmod(rows, BLOCK_SIZE)
         prefix_sizes.extend([BLOCK_SIZE] * full)
         if remainder:
             prefix_sizes.append(remainder)
-    prefix_rows = sum(prefix_segments)
+        prefix_parts.append(
+            torch.arange(start, start + rows, device=device, dtype=torch.long)
+        )
 
-    ts_t, ts_h, ts_w = VSA_TILE_SIZE
-    grid_t, grid_h, grid_w = video_grid
-    num_video_tiles_3d = (
-        math.ceil(grid_t / ts_t),
-        math.ceil(grid_h / ts_h),
-        math.ceil(grid_w / ts_w),
-    )
-    video_sizes = construct_variable_block_sizes(video_grid, num_video_tiles_3d, device)
-    # Tiled position -> packed row. Prefix rows keep their packed order; video
-    # rows are permuted into space-time cubes.
-    tile_partition = torch.cat(
-        [
-            torch.arange(prefix_rows, device=device, dtype=torch.long),
-            get_tile_partition_indices(video_grid, VSA_TILE_SIZE, device).to(torch.long)
-            + prefix_rows,
-        ]
-    )
+    video_parts: list[torch.Tensor] = []
+    video_size_parts: list[torch.Tensor] = []
+    for start, grid in pictures:
+        shape = _tile_shape_for(grid)
+        video_parts.append(
+            get_tile_partition_indices(grid, shape, device).to(torch.long) + start
+        )
+        video_size_parts.append(_block_sizes(grid, shape, device))
+
+    # Tiled position -> packed row. Protected rows keep their packed order;
+    # each picture's rows are permuted into its own tiles.
+    tile_partition = torch.cat(prefix_parts + video_parts)
+    video_sizes = torch.cat(video_size_parts)
     variable_block_sizes = torch.cat(
         [
             torch.tensor(prefix_sizes, dtype=torch.int32, device=device),
@@ -462,6 +592,7 @@ class VsaH3Schedule(msgspec.Struct, frozen=True):
 
     sparsity: float
     prefix_mode: str
+    sparsify_references: bool
     skip_first_steps: int
     skip_last_steps: int
     skip_first_layers: int
@@ -486,6 +617,9 @@ class VsaH3Schedule(msgspec.Struct, frozen=True):
                 config.get("sparsity", config.get("VSA_sparsity", DEFAULT_SPARSITY))
             ),
             prefix_mode=str(config.get("prefix_mode", DEFAULT_PREFIX_MODE)),
+            sparsify_references=bool(
+                config.get("sparsify_references", DEFAULT_SPARSIFY_REFERENCES)
+            ),
             skip_first_steps=int(
                 config.get("skip_first_steps", DEFAULT_SKIP_FIRST_STEPS)
             ),
@@ -598,7 +732,9 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
             )
             logger.info_once(
                 f"VSA-H3 attention: sparsity={self.schedule.sparsity} "
-                f"prefix_mode={self.schedule.prefix_mode}, dense for the first "
+                f"prefix_mode={self.schedule.prefix_mode}, reference pictures "
+                f"{'sparsified' if self.schedule.sparsify_references else 'protected'}"
+                f", dense for the first "
                 f"{self.schedule.skip_first_steps} denoise steps{tail}, the "
                 f"first {self.schedule.skip_first_layers} DiT layers"
                 + (
@@ -868,9 +1004,9 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         chunk = self._head_chunk_for(geometry, heads, query.element_size())
 
         logger.info_once(
-            f"VSA-H3 attention active: {tiles} tiles ({prefix_tiles} prefix + "
-            f"{geometry.num_video_tiles} video), keeping {topk}/"
-            f"{geometry.num_video_tiles} video tiles per video query tile, "
+            f"VSA-H3 attention active: {tiles} tiles ({prefix_tiles} protected "
+            f"+ {geometry.num_video_tiles} picture), keeping {topk}/"
+            f"{geometry.num_video_tiles} picture tiles per picture query tile, "
             f"{'INT8' if quantize else 'bf16'} Q.K and "
             f"{'FP8' if quantize_pv else 'bf16'} P.V, heads={heads} in slices "
             f"of {chunk}"
@@ -1001,11 +1137,19 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         value: torch.Tensor,
         geometry: VsaH3SequenceGeometry,
     ) -> torch.Tensor:
+        references = (
+            geometry.reference_visuals if self.schedule.sparsify_references else ()
+        )
         return self._sparse_attention(
             query,
             key,
             value,
-            _tile_geometry(geometry.prefix_segments, geometry.video_grid, query.device),
+            _tile_geometry(
+                geometry.prefix_segments,
+                geometry.video_grid,
+                query.device,
+                references,
+            ),
         )
 
     # ----------------------------------------------------------------- entries

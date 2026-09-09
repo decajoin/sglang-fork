@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h
     DEFAULT_QUANTIZE,
     DEFAULT_QUANTIZE_PV,
     DEFAULT_SKIP_FIRST_STEPS,
+    DEFAULT_SPARSIFY_REFERENCES,
     DEFAULT_SPARSITY,
     VideoSparseAttentionH3Backend,
     VideoSparseAttentionH3Impl,
@@ -52,6 +53,11 @@ BLOCK = 64
 # text, keyframe condition, audio | an 8 x 24 x 42 video patch grid
 PREFIX = (512, 300, 1000)
 VIDEO_GRID = (8, 24, 42)
+# A ref2va prefix: the prompt, a reference image, then a reference video's
+# audio and its frames, then the target audio. Segments 1 and 3 are pictures
+# and carry the patch grid their rows cover.
+REF_PREFIX = (512, 1008, 120, 1200, 300)
+REF_VISUALS = ((1, (1, 24, 42)), (3, (5, 12, 20)))
 
 _SERVER_ARGS = "sglang.multimodal_gen.runtime.server_args.get_global_server_args"
 _FORWARD_CTX = (
@@ -95,6 +101,14 @@ def _geometry() -> VsaH3SequenceGeometry:
     return VsaH3SequenceGeometry(prefix_segments=PREFIX, video_grid=VIDEO_GRID)
 
 
+def _ref_geometry() -> VsaH3SequenceGeometry:
+    return VsaH3SequenceGeometry(
+        prefix_segments=REF_PREFIX,
+        video_grid=VIDEO_GRID,
+        reference_visuals=REF_VISUALS,
+    )
+
+
 def _rows(geometry, device, heads=NUM_HEADS, dim=HEAD_DIM):
     return tuple(
         torch.randn(geometry.live_rows, heads, dim, device=device, dtype=torch.bfloat16)
@@ -116,7 +130,12 @@ def _masked_ref(q, k, v, geometry, sparsity, prefix_mode="exempt"):
     mask and hands that to SDPA, so nothing but the geometry helper is shared
     with the code under test.
     """
-    tiles = _tile_geometry(geometry.prefix_segments, geometry.video_grid, q.device)
+    tiles = _tile_geometry(
+        geometry.prefix_segments,
+        geometry.video_grid,
+        q.device,
+        geometry.reference_visuals,
+    )
     total, prefix, video = (
         tiles.num_tiles,
         tiles.num_prefix_tiles,
@@ -183,6 +202,18 @@ class TestVsaH3Schedule(unittest.TestCase):
         self.assertIs(schedule.quantize, DEFAULT_QUANTIZE)
         self.assertIs(schedule.quantize_pv, DEFAULT_QUANTIZE and DEFAULT_QUANTIZE_PV)
         self.assertEqual(schedule.head_chunk_budget_mib, DEFAULT_HEAD_CHUNK_BUDGET_MIB)
+
+    def test_references_are_sparsified_by_default(self):
+        with patch(_SERVER_ARGS, return_value=_FakeServerArgs({})):
+            self.assertIs(
+                VsaH3Schedule.from_server_args().sparsify_references,
+                DEFAULT_SPARSIFY_REFERENCES,
+            )
+        with patch(
+            _SERVER_ARGS,
+            return_value=_FakeServerArgs({"sparsify_references": False}),
+        ):
+            self.assertFalse(VsaH3Schedule.from_server_args().sparsify_references)
 
     def test_accepts_the_wan_vsa_sparsity_key(self):
         """The Wan VSA stages already put ``VSA_sparsity`` in this bag."""
@@ -337,6 +368,85 @@ class TestVsaH3TileGeometry(unittest.TestCase):
         tiles = _tile_geometry((), (4, 4, 4), torch.device("cpu"))
         self.assertEqual(tiles.num_prefix_tiles, 0)
         self.assertEqual(tiles.num_video_tiles, 1)
+
+
+class TestVsaH3ReferenceTiling(unittest.TestCase):
+    """A reference picture tiles like the generated video, not like prefix."""
+
+    def setUp(self):
+        self.device = torch.device("cpu")
+        self.geometry = _ref_geometry()
+        self.tiles = _tile_geometry(REF_PREFIX, VIDEO_GRID, self.device, REF_VISUALS)
+
+    def test_only_text_and_audio_stay_protected(self):
+        expected = []
+        for segment in (REF_PREFIX[0], REF_PREFIX[2], REF_PREFIX[4]):
+            full, remainder = divmod(segment, BLOCK)
+            expected.extend([BLOCK] * full)
+            if remainder:
+                expected.append(remainder)
+        self.assertEqual(
+            self.tiles.variable_block_sizes[: self.tiles.num_prefix_tiles].tolist(),
+            expected,
+        )
+
+    def test_every_picture_joins_the_selectable_tiles(self):
+        # The still cuts per frame as (1, 8, 8) over 24 x 42; the 5-frame
+        # reference and the 8-frame target cut on the (4, 4, 4) cube.
+        self.assertEqual(
+            self.tiles.num_video_tiles, (1 * 3 * 6) + (2 * 3 * 5) + (2 * 6 * 11)
+        )
+
+    def test_sizes_account_for_every_live_row(self):
+        self.assertEqual(
+            int(self.tiles.variable_block_sizes.sum()), self.geometry.live_rows
+        )
+
+    def test_scatter_index_is_injective_over_live_slots(self):
+        index = self.tiles.scatter_index
+        self.assertEqual(index.numel(), self.geometry.live_rows)
+        self.assertEqual(int(torch.unique(index).numel()), index.numel())
+        within = index % BLOCK
+        tile_of = index // BLOCK
+        self.assertTrue(bool((within < self.tiles.variable_block_sizes[tile_of]).all()))
+
+    def test_a_still_tiles_into_spatial_patches_of_its_own_frame(self):
+        """A 4-frame cube over a 1-frame block would waste 3/4 of every tile."""
+        start = REF_PREFIX[0]
+        first = self.tiles.num_prefix_tiles * BLOCK
+        rows = self.tiles.tile_rows[first : first + BLOCK].tolist()
+        _, _, grid_w = REF_VISUALS[0][1]
+        self.assertEqual(
+            sorted(rows),
+            sorted(start + h * grid_w + w for h in range(8) for w in range(8)),
+        )
+
+    def test_a_reference_block_keeps_its_rows_where_they_were_packed(self):
+        """Tiles are reordered; the rows they address are not."""
+        still_start = REF_PREFIX[0]
+        still_rows = REF_PREFIX[1]
+        index = self.tiles.scatter_index[still_start : still_start + still_rows]
+        self.assertEqual(int(torch.unique(index).numel()), still_rows)
+        # Every one of them lands in a picture tile, never a protected one.
+        self.assertTrue(
+            bool((index // BLOCK >= self.tiles.num_prefix_tiles).all())
+        )
+
+    def test_protecting_references_restores_the_old_tiling(self):
+        protected = _tile_geometry(REF_PREFIX, VIDEO_GRID, self.device)
+        self.assertEqual(
+            protected.num_prefix_tiles,
+            sum(math.ceil(segment / BLOCK) for segment in REF_PREFIX),
+        )
+        self.assertEqual(protected.num_video_tiles, 2 * 6 * 11)
+
+    def test_a_grid_that_does_not_cover_its_segment_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "covers"):
+            _tile_geometry((512, 100), VIDEO_GRID, self.device, ((1, (1, 5, 5)),))
+
+    def test_a_grid_naming_a_segment_that_does_not_exist_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "not in a"):
+            _tile_geometry((512,), VIDEO_GRID, self.device, ((3, (1, 8, 8)),))
 
 
 class TestVsaH3Gating(unittest.TestCase):
@@ -595,6 +705,88 @@ class TestVsaH3Numerics(unittest.TestCase):
         torch.testing.assert_close(
             out, _dense_ref(self.q, self.k, self.v), atol=2e-2, rtol=5e-2
         )
+
+
+@requires_gpu
+class TestVsaH3ReferenceNumerics(unittest.TestCase):
+    """Sparsifying reference pictures changes the budget, not the contract."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.device = torch.device("cuda")
+        self.geometry = _ref_geometry()
+        self.q, self.k, self.v = _rows(self.geometry, self.device)
+
+    def _run(self, impl):
+        with _at_step(30), vsa_h3_sequence_geometry(self.geometry):
+            return impl.forward(
+                self.q.unsqueeze(0), self.k.unsqueeze(0), self.v.unsqueeze(0)
+            )[0]
+
+    def test_zero_sparsity_reproduces_dense_attention(self):
+        impl = _make_impl(
+            {
+                "sparsity": 0.0,
+                "skip_first_steps": 0,
+                "min_seq_len": 64,
+                "quantize": False,
+            }
+        )
+        torch.testing.assert_close(
+            self._run(impl),
+            _dense_ref(self.q, self.k, self.v),
+            atol=2e-3,
+            rtol=2e-2,
+        )
+
+    def test_selection_matches_an_independent_implementation(self):
+        for sparsity in (0.5, 0.9):
+            with self.subTest(sparsity=sparsity):
+                impl = _make_impl(
+                    {
+                        "sparsity": sparsity,
+                        "skip_first_steps": 0,
+                        "min_seq_len": 64,
+                        "quantize": False,
+                    }
+                )
+                torch.testing.assert_close(
+                    self._run(impl),
+                    _masked_ref(self.q, self.k, self.v, self.geometry, sparsity),
+                    atol=2e-3,
+                    rtol=2e-2,
+                )
+
+    def test_protecting_references_computes_something_else(self):
+        """The switch has to reach the selection, not just the log line."""
+        config = {
+            "sparsity": 0.9,
+            "skip_first_steps": 0,
+            "min_seq_len": 64,
+            "quantize": False,
+        }
+        sparse = self._run(_make_impl(config))
+        protected = self._run(_make_impl({**config, "sparsify_references": False}))
+        self.assertFalse(torch.allclose(sparse, protected, atol=2e-3, rtol=2e-2))
+
+    def test_protecting_references_reproduces_the_untagged_geometry(self):
+        """``false`` must be exactly the behaviour before the tags existed."""
+        config = {
+            "sparsity": 0.9,
+            "skip_first_steps": 0,
+            "min_seq_len": 64,
+            "quantize": False,
+        }
+        impl = _make_impl({**config, "sparsify_references": False})
+        protected = self._run(impl)
+        untagged = VsaH3SequenceGeometry(
+            prefix_segments=REF_PREFIX, video_grid=VIDEO_GRID
+        )
+        with _at_step(30), vsa_h3_sequence_geometry(untagged):
+            reference = impl.forward(
+                self.q.unsqueeze(0), self.k.unsqueeze(0), self.v.unsqueeze(0)
+            )[0]
+        torch.testing.assert_close(protected, reference, atol=0, rtol=0)
 
 
 if __name__ == "__main__":
