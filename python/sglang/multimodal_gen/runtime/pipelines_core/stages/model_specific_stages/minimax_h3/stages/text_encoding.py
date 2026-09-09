@@ -290,6 +290,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                         "text_token_tags": torch.ones(
                             int(positive_ids.shape[0]), dtype=torch.long
                         ),
+                        "text_visual_spans": (),
                     }
                 }
         batch.extra[MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY] = embeddings
@@ -334,7 +335,9 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         image_token_counts = [
             int(image_grid_thw[i].prod().item()) // merge for i in range(len(images))
         ]
-        pos_ids, pos_tags = minimax_h3_multi_image_presentation(
+        # fl2va publishes no grids: its packed builder names no prefix segment
+        # as a picture, so a span would have nowhere to land.
+        pos_ids, pos_tags, pos_visual_spans = minimax_h3_multi_image_presentation(
             self.tokenizer,
             prompt=prompt,
             image_token_counts=image_token_counts,
@@ -349,6 +352,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 "hidden_states": pos_hidden,
                 "text_len": int(pos_ids.shape[0]),
                 "text_token_tags": pos_tags,
+                "text_visual_spans": pos_visual_spans,
             },
         }
 
@@ -445,6 +449,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         pixel_values = None
         image_grid_thw = None
         n_image_tokens = None
+        image_grids = None
         processor = self.processor
 
         if has_image:
@@ -459,9 +464,24 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                     f"expected {len(images)} image grids, got "
                     f"{list(image_grid_thw.shape)}"
                 )
-            merge = int(proc.image_processor.merge_size) ** 2
+            merge_size = int(proc.image_processor.merge_size)
+            merge = merge_size**2
             counts = [
                 int(image_grid_thw[i].prod().item()) // merge
+                for i in range(len(images))
+            ]
+            # The token grid a merged vision block occupies. The processor
+            # flattens patches merge-block-major and the merger collapses each
+            # block to one token, so the tokens that reach the DiT are a raster
+            # (t, h // merge_size, w // merge_size) grid -- the same shape, and
+            # the same 32px-per-token granularity, as the VAE-side reference
+            # rows for the same prepared image.
+            image_grids = [
+                (
+                    int(image_grid_thw[i][0]),
+                    int(image_grid_thw[i][1]) // merge_size,
+                    int(image_grid_thw[i][2]) // merge_size,
+                )
                 for i in range(len(images))
             ]
             # presentation takes an int for one image, a list for several
@@ -471,6 +491,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         video_grid_thw = None
         video_block_token_counts = None
         video_block_timestamps = None
+        video_grids = None
         if has_video:
             prepared = prepared_videos or minimax_h3_prepared_reference_videos(
                 batch, plan
@@ -495,9 +516,11 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                     f"expected {len(videos)} video grids, got "
                     f"{list(video_grid_thw.shape)}"
                 )
-            merge = int(proc.image_processor.merge_size) ** 2
+            merge_size = int(proc.image_processor.merge_size)
+            merge = merge_size**2
             video_block_token_counts = []
             video_block_timestamps = []
+            video_grids = []
             for index, sampled in enumerate(sampled_videos):
                 n_blocks = int(video_grid_thw[index, 0])
                 per_block = (
@@ -513,22 +536,35 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                     )
                 video_block_token_counts.append([per_block] * n_blocks)
                 video_block_timestamps.append(timestamps)
+                # One temporal block's token grid. The blocks are separated by
+                # their timestamp text, so each is its own picture rather than
+                # one (n_blocks, h, w) volume.
+                video_grids.append(
+                    (
+                        1,
+                        int(video_grid_thw[index, 1]) // merge_size,
+                        int(video_grid_thw[index, 2]) // merge_size,
+                    )
+                )
 
         if has_video:
-            pos_ids, pos_tags = minimax_h3_ref2va_video_presentation(
+            pos_ids, pos_tags, pos_visual_spans = minimax_h3_ref2va_video_presentation(
                 self.tokenizer,
                 prompt=plan.prompt,
                 condition_labels=condition_labels,
                 image_token_count=n_image_tokens,
+                image_grids=image_grids,
+                video_grids=video_grids,
                 video_block_token_counts=video_block_token_counts,
                 video_block_timestamps=video_block_timestamps,
             )
         else:
-            pos_ids, pos_tags = minimax_h3_ref2va_presentation(
+            pos_ids, pos_tags, pos_visual_spans = minimax_h3_ref2va_presentation(
                 self.tokenizer,
                 prompt=plan.prompt,
                 condition_labels=condition_labels,
                 image_token_count=n_image_tokens,
+                image_grids=image_grids,
             )
         pos_hidden = encode_ids(
             pos_ids,
@@ -544,6 +580,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 "hidden_states": pos_hidden,
                 "text_len": int(pos_ids.shape[0]),
                 "text_token_tags": pos_tags,
+                "text_visual_spans": pos_visual_spans,
             },
         }
 

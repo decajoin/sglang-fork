@@ -238,6 +238,29 @@ _PREFIX_MODES = ("exempt", "compete")
 # and set ``{"sparsify_references": false}`` to get the protected behaviour
 # back for the comparison.
 DEFAULT_SPARSIFY_REFERENCES = True
+# Whether the reference pictures Qwen3-VL packs into the *text* conditioning are
+# tiled and sparsified too.
+#
+# Every reference image is encoded twice: once by the VAE into the picture rows
+# above, and once by Qwen3-VL as a vision block inside the prompt, at the same
+# 32px-per-token granularity and so at very nearly the same row count. The
+# second copy wears the TEXT tag, which is why it is protected here and why
+# ``sparge_attn``, which reads the per-row tags the presentation writes, has
+# always sparsified it.
+#
+# Off by default because it is not the same trade as the first copy. Those
+# tokens are contextualised: inside Qwen they have already attended to the
+# prompt and to the other references, so they carry which subject an
+# instruction is about and not only what it looks like, which makes dropping
+# one closer to dropping prompt tokens than to dropping pixels. The failure
+# mode is the quiet one -- weakened prompt adherence that never looks broken --
+# so this wants a measured render behind it, not a plausible argument. What it
+# buys, measured on one RTX 5090 at 14 heads and D=128 over a 12s 768p 16:9
+# request with six reference images at short edge 1024: the attention op goes
+# from 92.7 to 46.0 ms, and the advantage over ``sparge_attn`` stops decaying
+# with the reference count (1.07x -> 2.19x at six images, against 1.66x ->
+# 2.00x at one).
+DEFAULT_SPARSIFY_TEXT_VISUALS = False
 
 
 @dataclass(frozen=True)
@@ -261,11 +284,21 @@ class VsaH3SequenceGeometry:
     it does not name (the prompt, every audio block) stay protected. Leaving it
     empty is the pre-existing behaviour and is what a builder that publishes no
     grids gets.
+
+    ``text_visuals`` names the same pictures where Qwen3-VL packed a second copy
+    of each one *inside* the prompt, as ``(start, rows, (T, H, W))`` offsets
+    into the first prefix segment rather than as segment indices. They are held
+    apart from ``reference_visuals`` for two reasons: they are a separate
+    quality decision under a separate switch, and turning them into segments
+    costs a partial tile per boundary, which is a price only a run that actually
+    sparsifies them should pay. Once selected the two are cut and ranked
+    identically.
     """
 
     prefix_segments: tuple[int, ...]
     video_grid: tuple[int, int, int]
     reference_visuals: tuple[tuple[int, tuple[int, int, int]], ...] = ()
+    text_visuals: tuple[tuple[int, int, tuple[int, int, int]], ...] = ()
 
     @property
     def prefix_rows(self) -> int:
@@ -369,6 +402,69 @@ class _TileGeometry:
     @property
     def padded_rows(self) -> int:
         return self.num_tiles * BLOCK_SIZE
+
+
+@functools.lru_cache(maxsize=8)
+def _split_text_visuals(
+    prefix_segments: tuple[int, ...],
+    reference_visuals: tuple[tuple[int, tuple[int, int, int]], ...],
+    text_visuals: tuple[tuple[int, int, tuple[int, int, int]], ...],
+) -> tuple[
+    tuple[int, ...],
+    tuple[tuple[int, tuple[int, int, int]], ...],
+    tuple[tuple[int, tuple[int, int, int]], ...],
+]:
+    """Cut the text segment around the pictures Qwen3-VL packed into it.
+
+    Returns the new prefix, the text pictures it exposed, and
+    ``reference_visuals`` re-indexed onto it -- three values because the two
+    picture kinds answer to different switches and the caller decides which to
+    hand the tiler.
+
+    The text block is the first prefix segment by construction, and the spans
+    are ordered, disjoint offsets into it. Each one becomes its own segment so
+    it can be tiled on its patch grid; the gaps around them -- the
+    ``<Picture i>`` labels, the two vision sentinels, the prompt -- stay
+    protected, so a tile never pools a label with the picture it names.
+
+    Only called when the switch is on. Splitting is not free: every boundary
+    rounds a protected segment up to a whole tile, which on a six-reference
+    request is nine tiles and 3.5% of the op, so a run that leaves the pictures
+    protected must keep the segment whole and get exactly its old geometry.
+    """
+    if not text_visuals:
+        return prefix_segments, (), reference_visuals
+    if not prefix_segments:
+        raise ValueError("VSA-H3 text_visuals need a text segment to sit in")
+    text_len = prefix_segments[0]
+    segments: list[int] = []
+    pictures: list[tuple[int, tuple[int, int, int]]] = []
+
+    def add(rows: int, grid: tuple[int, int, int] | None = None) -> None:
+        if not rows:
+            return
+        if grid is not None:
+            pictures.append((len(segments), grid))
+        segments.append(rows)
+
+    cursor = 0
+    for start, rows, grid in text_visuals:
+        if start < cursor or rows <= 0 or start + rows > text_len:
+            raise ValueError(
+                f"VSA-H3 text visual span ({start}, {rows}) is out of order or "
+                f"escapes the {text_len}-row text segment"
+            )
+        add(start - cursor)
+        add(rows, grid)
+        cursor = start + rows
+    add(text_len - cursor)
+
+    shift = len(segments) - 1
+    return (
+        tuple(segments) + prefix_segments[1:],
+        tuple(pictures),
+        tuple((index + shift, grid) for index, grid in reference_visuals),
+    )
 
 
 @functools.lru_cache(maxsize=8)
@@ -593,6 +689,7 @@ class VsaH3Schedule(msgspec.Struct, frozen=True):
     sparsity: float
     prefix_mode: str
     sparsify_references: bool
+    sparsify_text_visuals: bool
     skip_first_steps: int
     skip_last_steps: int
     skip_first_layers: int
@@ -619,6 +716,9 @@ class VsaH3Schedule(msgspec.Struct, frozen=True):
             prefix_mode=str(config.get("prefix_mode", DEFAULT_PREFIX_MODE)),
             sparsify_references=bool(
                 config.get("sparsify_references", DEFAULT_SPARSIFY_REFERENCES)
+            ),
+            sparsify_text_visuals=bool(
+                config.get("sparsify_text_visuals", DEFAULT_SPARSIFY_TEXT_VISUALS)
             ),
             skip_first_steps=int(
                 config.get("skip_first_steps", DEFAULT_SKIP_FIRST_STEPS)
@@ -734,6 +834,8 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
                 f"VSA-H3 attention: sparsity={self.schedule.sparsity} "
                 f"prefix_mode={self.schedule.prefix_mode}, reference pictures "
                 f"{'sparsified' if self.schedule.sparsify_references else 'protected'}"
+                f", text-side reference pictures "
+                f"{'sparsified' if self.schedule.sparsify_text_visuals else 'protected'}"
                 f", dense for the first "
                 f"{self.schedule.skip_first_steps} denoise steps{tail}, the "
                 f"first {self.schedule.skip_first_layers} DiT layers"
@@ -1137,18 +1239,25 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         value: torch.Tensor,
         geometry: VsaH3SequenceGeometry,
     ) -> torch.Tensor:
-        references = (
-            geometry.reference_visuals if self.schedule.sparsify_references else ()
-        )
+        segments = geometry.prefix_segments
+        references = geometry.reference_visuals
+        text_pictures: tuple[tuple[int, tuple[int, int, int]], ...] = ()
+        if self.schedule.sparsify_text_visuals:
+            segments, text_pictures, references = _split_text_visuals(
+                segments, references, geometry.text_visuals
+            )
+        pictures = text_pictures
+        if self.schedule.sparsify_references:
+            pictures += references
         return self._sparse_attention(
             query,
             key,
             value,
             _tile_geometry(
-                geometry.prefix_segments,
+                segments,
                 geometry.video_grid,
                 query.device,
-                references,
+                pictures,
             ),
         )
 

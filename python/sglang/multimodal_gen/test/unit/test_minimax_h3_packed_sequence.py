@@ -182,6 +182,110 @@ class TestMiniMaxH3PackedSequence(unittest.TestCase):
         for index, grid in built["reference_visuals"]:
             self.assertEqual(grid[0] * grid[1] * grid[2], segments[index])
 
+    def test_ref2va_splits_the_text_block_around_its_pictures(self):
+        """Qwen packs a vision block per reference image inside the prompt."""
+        built = minimax_h3_packed_sequence_ref2va_blocks(
+            text_len=100,
+            latent_t=2,
+            latent_h=4,
+            latent_w=4,
+            audio_t=5,
+            ref_blocks=[{"kind": "image", "latent_h": 8, "latent_w": 12}],
+            text_visuals=[(10, 24, (1, 4, 6)), (40, 12, (1, 3, 4))],
+        )
+        segments = built["prefix_segments"]
+        # The text block stays one segment: splitting it costs a partial tile
+        # per boundary, and only a backend that sparsifies it should pay that.
+        self.assertEqual(segments, (100, 24, 10))
+        self.assertEqual(
+            built["text_visuals"], ((10, 24, (1, 4, 6)), (40, 12, (1, 3, 4)))
+        )
+        self.assertEqual(built["reference_visuals"], ((1, (1, 4, 6)),))
+        for start, rows, grid in built["text_visuals"]:
+            self.assertEqual(grid[0] * grid[1] * grid[2], rows)
+            self.assertLessEqual(start + rows, segments[0])
+
+    def test_ref2va_text_pictures_stay_tagged_text_for_per_row_backends(self):
+        """The split is structural; the per-row tags are the caller's to write."""
+        built = minimax_h3_packed_sequence_ref2va_blocks(
+            text_len=100,
+            latent_t=2,
+            latent_h=4,
+            latent_w=4,
+            audio_t=5,
+            ref_blocks=[{"kind": "image", "latent_h": 8, "latent_w": 12}],
+            text_visuals=[(10, 24, (1, 4, 6))],
+        )
+        self.assertEqual(
+            built["token_tags"][built["text_pos"]].unique().tolist(), [1]
+        )
+
+    def test_ref2va_text_pictures_may_touch_both_edges_of_the_block(self):
+        """Spans that tile the whole block leave no protected gap at all."""
+        built = minimax_h3_packed_sequence_ref2va_blocks(
+            text_len=36,
+            latent_t=2,
+            latent_h=4,
+            latent_w=4,
+            audio_t=5,
+            ref_blocks=[],
+            text_visuals=[(0, 12, (1, 3, 4)), (12, 24, (1, 4, 6))],
+        )
+        self.assertEqual(built["prefix_segments"], (36, 10))
+        self.assertEqual(
+            built["text_visuals"], ((0, 12, (1, 3, 4)), (12, 24, (1, 4, 6)))
+        )
+
+    def test_ref2va_publishes_every_temporal_block_of_a_video_reference(self):
+        """Qwen packs one vision block per merged second, not one per video."""
+        spans = [(4, 12, (1, 3, 4)), (20, 12, (1, 3, 4)), (36, 12, (1, 3, 4))]
+        built = minimax_h3_packed_sequence_ref2va_blocks(
+            text_len=60,
+            latent_t=2,
+            latent_h=4,
+            latent_w=4,
+            audio_t=5,
+            ref_blocks=[
+                {
+                    "kind": "video",
+                    "ref_audio_t": 0,
+                    "latent_t": 2,
+                    "latent_h": 4,
+                    "latent_w": 6,
+                }
+            ],
+            text_visuals=spans,
+        )
+        self.assertEqual(built["text_visuals"], tuple(spans))
+        self.assertEqual(built["prefix_segments"], (60, 12, 10))
+        self.assertEqual(built["reference_visuals"], ((1, (2, 2, 3)),))
+
+    def test_ref2va_rejects_text_spans_that_do_not_describe_the_block(self):
+        base = dict(
+            text_len=36,
+            latent_t=2,
+            latent_h=4,
+            latent_w=4,
+            audio_t=5,
+            ref_blocks=[],
+        )
+        with self.assertRaisesRegex(ValueError, "escapes"):
+            minimax_h3_packed_sequence_ref2va_blocks(
+                **base, text_visuals=[(30, 12, (1, 3, 4))]
+            )
+        with self.assertRaisesRegex(ValueError, "overlaps"):
+            minimax_h3_packed_sequence_ref2va_blocks(
+                **base, text_visuals=[(0, 12, (1, 3, 4)), (6, 12, (1, 3, 4))]
+            )
+        with self.assertRaisesRegex(ValueError, "must cover rows"):
+            minimax_h3_packed_sequence_ref2va_blocks(
+                **base, text_visuals=[(0, 0, (1, 3, 4))]
+            )
+        with self.assertRaisesRegex(ValueError, "covers"):
+            minimax_h3_packed_sequence_ref2va_blocks(
+                **base, text_visuals=[(0, 12, (1, 3, 5))]
+            )
+
     def test_ref2va_mixed_media_preserves_temporal_origin(self):
         built = minimax_h3_packed_sequence_ref2va_blocks(
             text_len=5,

@@ -96,6 +96,8 @@ def _vsa_h3_geometry_publisher():
             # fl2va layout) publishes no grids, and the backend protects the
             # whole prefix as it did before.
             references = packed.get("reference_visuals") or ()
+            text_visuals = packed.get("text_visuals") or ()
+
             return vsa_h3_sequence_geometry(
                 VsaH3SequenceGeometry(
                     prefix_segments=tuple(int(rows) for rows in segments),
@@ -103,6 +105,12 @@ def _vsa_h3_geometry_publisher():
                     reference_visuals=tuple(
                         (int(index), tuple(int(axis) for axis in block_grid))
                         for index, block_grid in references
+                    ),
+                    # (start, rows, grid) offsets into the text segment, not
+                    # segment indices -- the backend splits it only if asked.
+                    text_visuals=tuple(
+                        (int(start), int(rows), tuple(int(axis) for axis in span_grid))
+                        for start, rows, span_grid in text_visuals
                     ),
                 )
             )
@@ -959,6 +967,7 @@ def _build_packed_layout(
             latent_w=ctx.latent_w,
             audio_t=ctx.audio_t,
             ref_blocks=ctx.ref2va_positive_blocks,
+            text_visuals=emb.get("text_visual_spans") or (),
         )
     else:
         packed = minimax_h3_packed_sequence(

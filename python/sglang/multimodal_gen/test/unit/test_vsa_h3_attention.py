@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h
     VsaH3Schedule,
     VsaH3SequenceGeometry,
     _dit_layer_index,
+    _split_text_visuals,
     _tile_geometry,
     compute_topk,
     vsa_h3_sequence_geometry,
@@ -58,6 +59,28 @@ VIDEO_GRID = (8, 24, 42)
 # and carry the patch grid their rows cover.
 REF_PREFIX = (512, 1008, 120, 1200, 300)
 REF_VISUALS = ((1, (1, 24, 42)), (3, (5, 12, 20)))
+
+# text block (prompt head + Qwen vision block + prompt tail) | VAE latents |
+# audio. The Qwen grid divides the (1, 8, 8) tile exactly, so splitting the
+# text block moves rows between the protected and picture pools without
+# changing how many tiles hold them.
+TEXT_PREFIX = (1280, 1200, 300)
+TEXT_REF_VISUALS = ((1, (5, 12, 20)),)
+TEXT_VISUALS = ((256, 960, (1, 24, 40)),)
+# What ``_split_text_visuals`` must produce from those: head | picture | tail.
+TEXT_SPLIT_PREFIX = (256, 960, 64, 1200, 300)
+TEXT_SPLIT_PICTURES = ((1, (1, 24, 40)),)
+TEXT_SPLIT_REFERENCES = ((3, (5, 12, 20)),)
+
+
+def _text_geometry(**overrides) -> VsaH3SequenceGeometry:
+    return VsaH3SequenceGeometry(
+        prefix_segments=TEXT_PREFIX,
+        video_grid=VIDEO_GRID,
+        reference_visuals=TEXT_REF_VISUALS,
+        text_visuals=TEXT_VISUALS,
+        **overrides,
+    )
 
 _SERVER_ARGS = "sglang.multimodal_gen.runtime.server_args.get_global_server_args"
 _FORWARD_CTX = (
@@ -447,6 +470,169 @@ class TestVsaH3ReferenceTiling(unittest.TestCase):
     def test_a_grid_naming_a_segment_that_does_not_exist_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "not in a"):
             _tile_geometry((512,), VIDEO_GRID, self.device, ((3, (1, 8, 8)),))
+
+
+class TestVsaH3TextVisualSplit(unittest.TestCase):
+    """Qwen packs a second copy of every reference image into the prompt."""
+
+    def test_the_split_exposes_the_picture_and_reindexes_the_rest(self):
+        segments, pictures, references = _split_text_visuals(
+            TEXT_PREFIX, TEXT_REF_VISUALS, TEXT_VISUALS
+        )
+        self.assertEqual(segments, TEXT_SPLIT_PREFIX)
+        self.assertEqual(pictures, TEXT_SPLIT_PICTURES)
+        self.assertEqual(references, TEXT_SPLIT_REFERENCES)
+        for index, grid in pictures + references:
+            self.assertEqual(math.prod(grid), segments[index])
+
+    def test_no_spans_leaves_the_prefix_exactly_as_it_was(self):
+        segments, pictures, references = _split_text_visuals(
+            TEXT_PREFIX, TEXT_REF_VISUALS, ()
+        )
+        self.assertIs(segments, TEXT_PREFIX)
+        self.assertEqual(pictures, ())
+        self.assertIs(references, TEXT_REF_VISUALS)
+
+    def test_a_picture_spanning_the_whole_block_leaves_no_gap(self):
+        segments, pictures, _ = _split_text_visuals(
+            (960, 300), (), ((0, 960, (1, 24, 40)),)
+        )
+        self.assertEqual(segments, (960, 300))
+        self.assertEqual(pictures, ((0, (1, 24, 40)),))
+
+    def test_a_reference_video_contributes_one_picture_per_temporal_block(self):
+        """Timestamp text splits the blocks, so they cannot be one volume."""
+        block = (1, 8, 16)
+        rows = math.prod(block)
+        spans = tuple(
+            (16 + index * (rows + 4), rows, block) for index in range(3)
+        )
+        text_len = 16 + 3 * (rows + 4)
+        segments, pictures, _ = _split_text_visuals((text_len, 300), (), spans)
+        # timestamp | block | timestamp | block | timestamp | block | tail
+        self.assertEqual(len(pictures), 3)
+        self.assertEqual(segments[:1], (16,))
+        for index, grid in pictures:
+            self.assertEqual(math.prod(grid), segments[index])
+        # The protected gaps between them survive.
+        self.assertEqual([segments[index - 1] for index, _ in pictures], [16, 4, 4])
+
+    def test_a_span_that_escapes_the_text_segment_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "escapes"):
+            _split_text_visuals((512, 300), (), ((256, 960, (1, 24, 40)),))
+
+    def test_the_split_moves_rows_between_the_two_pools(self):
+        device = torch.device("cuda")
+        protected = _tile_geometry(TEXT_PREFIX, VIDEO_GRID, device, TEXT_REF_VISUALS)
+        sparsified = _tile_geometry(
+            TEXT_SPLIT_PREFIX,
+            VIDEO_GRID,
+            device,
+            TEXT_SPLIT_PICTURES + TEXT_SPLIT_REFERENCES,
+        )
+        moved = TEXT_VISUALS[0][1] // BLOCK
+        self.assertEqual(
+            sparsified.num_video_tiles, protected.num_video_tiles + moved
+        )
+
+    def test_a_text_picture_is_cut_on_its_own_grid(self):
+        """A one-frame Qwen block takes the spatial tile, not the 4-frame cube."""
+        tiles = _tile_geometry(
+            TEXT_SPLIT_PREFIX,
+            VIDEO_GRID,
+            torch.device("cuda"),
+            TEXT_SPLIT_PICTURES + TEXT_SPLIT_REFERENCES,
+        )
+        start = TEXT_SPLIT_PREFIX[0]
+        _, _, grid_w = TEXT_SPLIT_PICTURES[0][1]
+        first = tiles.num_prefix_tiles * BLOCK
+        rows = tiles.tile_rows[first : first + BLOCK].tolist()
+        self.assertEqual(
+            sorted(rows),
+            sorted(start + h * grid_w + w for h in range(8) for w in range(8)),
+        )
+
+
+class TestVsaH3TextVisualNumerics(unittest.TestCase):
+    """The text-side switch has to reach the selection, not just the log line."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.device = torch.device("cuda")
+        self.geometry = _text_geometry()
+        self.q, self.k, self.v = _rows(self.geometry, self.device)
+
+    def _run(self, impl, geometry=None):
+        with _at_step(30), vsa_h3_sequence_geometry(geometry or self.geometry):
+            return impl.forward(
+                self.q.unsqueeze(0), self.k.unsqueeze(0), self.v.unsqueeze(0)
+            )[0]
+
+    def _config(self, **overrides):
+        return {
+            "sparsity": 0.9,
+            "skip_first_steps": 0,
+            "min_seq_len": 64,
+            "quantize": False,
+            **overrides,
+        }
+
+    def test_it_is_off_by_default(self):
+        default = self._run(_make_impl(self._config()))
+        protected = self._run(
+            _make_impl(self._config(sparsify_text_visuals=False))
+        )
+        torch.testing.assert_close(default, protected, atol=0, rtol=0)
+
+    def test_switching_it_on_computes_something_else(self):
+        protected = self._run(_make_impl(self._config()))
+        sparsified = self._run(
+            _make_impl(self._config(sparsify_text_visuals=True))
+        )
+        self.assertFalse(
+            torch.allclose(protected, sparsified, atol=2e-3, rtol=2e-2)
+        )
+
+    def test_leaving_it_off_ignores_the_published_spans(self):
+        """``false`` must be exactly the behaviour before the spans existed."""
+        impl = _make_impl(self._config())
+        untagged = VsaH3SequenceGeometry(
+            prefix_segments=TEXT_PREFIX,
+            video_grid=VIDEO_GRID,
+            reference_visuals=TEXT_REF_VISUALS,
+        )
+        torch.testing.assert_close(
+            self._run(impl), self._run(impl, untagged), atol=0, rtol=0
+        )
+
+    def test_zero_sparsity_reproduces_dense_attention(self):
+        impl = _make_impl(
+            self._config(sparsity=0.0, sparsify_text_visuals=True)
+        )
+        torch.testing.assert_close(
+            self._run(impl),
+            _dense_ref(self.q, self.k, self.v),
+            atol=2e-3,
+            rtol=2e-2,
+        )
+
+    def test_selection_matches_an_independent_implementation(self):
+        for sparsity in (0.5, 0.9):
+            with self.subTest(sparsity=sparsity):
+                impl = _make_impl(
+                    self._config(sparsity=sparsity, sparsify_text_visuals=True)
+                )
+                merged = VsaH3SequenceGeometry(
+                    prefix_segments=TEXT_SPLIT_PREFIX,
+                    video_grid=VIDEO_GRID,
+                    reference_visuals=TEXT_SPLIT_PICTURES + TEXT_SPLIT_REFERENCES,
+                )
+                torch.testing.assert_close(
+                    self._run(impl),
+                    _masked_ref(self.q, self.k, self.v, merged, sparsity),
+                    atol=2e-3,
+                    rtol=2e-2,
+                )
 
 
 class TestVsaH3Gating(unittest.TestCase):

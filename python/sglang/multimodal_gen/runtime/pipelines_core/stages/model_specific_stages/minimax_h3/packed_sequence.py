@@ -17,6 +17,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import math
+
 import numpy as np
 import torch
 
@@ -279,6 +281,52 @@ def _cat_ranges(parts: list[torch.Tensor]) -> torch.Tensor:
     return torch.empty(0, dtype=torch.long)
 
 
+def _validated_text_visuals(
+    text_visuals: Sequence[tuple[int, int, tuple[int, int, int]]],
+    text_len: int,
+) -> tuple[tuple[int, int, tuple[int, int, int]], ...]:
+    """Check the pictures Qwen3-VL packed inside the text block and normalise them.
+
+    Every reference image is encoded twice: once by the VAE into the reference
+    rows below, and once by Qwen3-VL as a vision block inside the prompt, at the
+    same 32px-per-token granularity and so at very nearly the same row count.
+    Publishing where those runs are lets a tile-based backend cut them on their
+    patch grid instead of protecting a text block that grows with the reference
+    count. Per-row backends need none of it -- they already read the VIDEO tag
+    the presentation writes on those rows.
+
+    Kept as ``(start, rows, grid)`` offsets into the text block rather than as
+    prefix segments, because splitting the block costs a partial tile per
+    boundary and only the backend knows whether its switch is on: a six-image
+    request pays nine tiles for a split it would not use.
+    """
+    out: list[tuple[int, int, tuple[int, int, int]]] = []
+    cursor = 0
+    for start, rows, grid in text_visuals:
+        start, rows = int(start), int(rows)
+        if rows <= 0:
+            raise ValueError(f"text visual span at {start} must cover rows, got {rows}")
+        if start < cursor:
+            raise ValueError(
+                f"text visual span at {start} overlaps the previous span, which "
+                f"ended at {cursor}"
+            )
+        if start + rows > text_len:
+            raise ValueError(
+                f"text visual span ({start}, {rows}) escapes the {text_len}-row "
+                "text block"
+            )
+        axes = tuple(int(axis) for axis in grid)
+        if math.prod(axes) != rows:
+            raise ValueError(
+                f"text visual grid {axes} covers {math.prod(axes)} rows but the "
+                f"span at {start} holds {rows}"
+            )
+        out.append((start, rows, axes))
+        cursor = start + rows
+    return tuple(out)
+
+
 def minimax_h3_packed_sequence_ref2va_blocks(
     *,
     text_len: int,
@@ -288,6 +336,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     audio_t: int,
     ref_blocks: Sequence[Mapping[str, object]],
     audio_channel: int = 2,
+    text_visuals: Sequence[tuple[int, int, tuple[int, int, int]]] = (),
     seq_len: int | None = None,
 ) -> dict[str, Any]:
     """General ref2va-family packed layout.
@@ -549,6 +598,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         "cu_seqlens": cu,
         "prefix_segments": tuple(prefix_segments),
         "reference_visuals": tuple(reference_visuals),
+        "text_visuals": _validated_text_visuals(text_visuals, text_len),
         "video_grid": (latent_t, ph, pw),
     }
 
