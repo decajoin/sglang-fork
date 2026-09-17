@@ -63,6 +63,10 @@ class MiniMaxH3VideoModelAdapter:
             "output_mode",
             "imgvid_cond_noise_aug_for_inference",
             "audio_cond_noise_aug_for_inference",
+            "total_duration_seconds",
+            "chunk_prompts",
+            "streaming_kv_recent_chunks",
+            "streaming_kv_video_only_sink",
         }
     )
     supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
@@ -185,6 +189,20 @@ class MiniMaxH3VideoModelAdapter:
                 ),
             }
         )
+        # Only surface the streaming fields when the caller sent them, so an
+        # ordinary request lowers exactly the payload it always did.
+        total_duration = self._positive_finite_extra(
+            request, "total_duration_seconds"
+        )
+        if total_duration is not None:
+            kwargs["total_duration_seconds"] = total_duration
+        chunk_prompts = _parse_extra_value(_extra_value(request, "chunk_prompts"))
+        if chunk_prompts is not None:
+            kwargs["chunk_prompts"] = chunk_prompts
+        for name in ("streaming_kv_recent_chunks", "streaming_kv_video_only_sink"):
+            value = _parse_extra_value(_extra_value(request, name))
+            if value is not None:
+                kwargs[name] = value
         if quality is not None:
             kwargs["quality"] = quality
         return kwargs
@@ -291,6 +309,18 @@ class MiniMaxH3VideoModelAdapter:
             )
         return shape
 
+    @staticmethod
+    def _streaming_published_frames(batch: Req) -> int | None:
+        """Joined frame count for a streaming request, else None.
+
+        Resolved before the request is queued, so it is readable wherever the
+        queued request is -- including the API process that validates delivery.
+        """
+        published = getattr(
+            batch.sampling_params, "streaming_published_frames", None
+        )
+        return None if published is None else int(published)
+
     def project_queued_job_fields(self, batch: Req) -> dict[str, str]:
         shape = self._resolved_shape(batch)
         if shape is None:
@@ -298,7 +328,10 @@ class MiniMaxH3VideoModelAdapter:
         fields: dict[str, str] = {}
         if shape.get("width") is not None and shape.get("height") is not None:
             fields["size"] = f"{int(shape['width'])}x{int(shape['height'])}"
-        queued_frame_count = shape.get("frame_count")
+        # Report the length the caller will actually receive.
+        queued_frame_count = self._streaming_published_frames(batch)
+        if queued_frame_count is None:
+            queued_frame_count = shape.get("frame_count")
         if queued_frame_count is not None:
             fields["seconds"] = _format_video_seconds(
                 int(queued_frame_count) / float(shape["fps"])
@@ -325,7 +358,13 @@ class MiniMaxH3VideoModelAdapter:
         expected_size = None
         shape = self._resolved_shape(batch)
         if shape is not None:
-            if shape.get("frame_count") is not None:
+            # A streaming request publishes many chunks as one file, so its
+            # joined length is what delivery has to match; shape["frame_count"]
+            # keeps describing a single chunk for the geometry code.
+            published = self._streaming_published_frames(batch)
+            if published is not None:
+                expected_frame_count = published
+            elif shape.get("frame_count") is not None:
                 expected_frame_count = int(shape["frame_count"])
             if shape.get("width") is not None and shape.get("height") is not None:
                 expected_size = (int(shape["width"]), int(shape["height"]))

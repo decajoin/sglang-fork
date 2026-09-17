@@ -197,6 +197,7 @@ def _normalized_bcg_model_refs(model_ref: str | None) -> set[str]:
     return refs
 
 
+
 @dataclasses.dataclass
 class ServerArgs(DisaggServerArgsMixin):
     # Model and path configuration (for convenience)
@@ -344,6 +345,14 @@ class ServerArgs(DisaggServerArgsMixin):
     # MiniMax-H3 ref2va: short-edge tier every reference VIDEO is resized to.
     # None keeps the released behaviour of following the target's own tier.
     minimax_h3_reference_video_short_edge: int | None = None
+    # MiniMax-H3 streaming long video: split one request into N fixed-length
+    # chunks generated back to back, chaining each chunk's last decoded frame
+    # into the next chunk as an fl2va first-frame anchor. Off keeps the
+    # single-shot 4-15s request path byte for byte.
+    enable_streaming: bool = False
+    # Per-chunk nominal duration. The 17n+5 frame grid rounds it up, so 5.0
+    # resolves to 124 frames (5.1667s) -- the audited single-request workload.
+    streaming_chunk_seconds: float = 5.0
     _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
 
     # ComfyUI integration
@@ -552,7 +561,59 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_reference_image_short_edge()
+        self._validate_streaming()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_streaming(self) -> None:
+        """Keep a streaming chunk inside the single-request duration window.
+
+        A chunk is an ordinary request internally, so it has to satisfy the
+        same 4-15s contract the per-request validator enforces. Checking it
+        here fails at launch instead of on the first long request.
+        """
+        if not self.enable_streaming:
+            return
+        from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+            MiniMaxH3PipelineConfig,
+        )
+
+        if not isinstance(self.pipeline_config, MiniMaxH3PipelineConfig):
+            raise ValueError(
+                "--enable-streaming is implemented for MiniMax-H3 only, got "
+                f"{type(self.pipeline_config).__name__}"
+            )
+        seconds = self.streaming_chunk_seconds
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+            raise ValueError("streaming_chunk_seconds must be a number")
+        seconds = float(seconds)
+        if not math.isfinite(seconds):
+            raise ValueError("streaming_chunk_seconds must be finite")
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+            MINIMAX_H3_MAX_DURATION_SECONDS,
+            MINIMAX_H3_MIN_DURATION_SECONDS,
+        )
+
+        if not (
+            MINIMAX_H3_MIN_DURATION_SECONDS
+            <= seconds
+            <= MINIMAX_H3_MAX_DURATION_SECONDS
+        ):
+            raise ValueError(
+                "streaming_chunk_seconds must be within "
+                f"[{MINIMAX_H3_MIN_DURATION_SECONDS:g}, "
+                f"{MINIMAX_H3_MAX_DURATION_SECONDS:g}], got {seconds:g}"
+            )
+        self.streaming_chunk_seconds = seconds
+
+        if self.attention_backend not in (None, "fa"):
+            # Chunks share one clean K/V history, and merging it needs each
+            # partial's log-sum-exp, which the sparse backends do not report.
+            # Fail here rather than after the first chunk has been generated.
+            raise ValueError(
+                "--enable-streaming requires --attention-backend fa; "
+                f"{self.attention_backend} does not report the log-sum-exp "
+                "the cross-chunk history merge needs"
+            )
 
     def _validate_minimax_h3_reference_image_short_edge(self) -> None:
         if self.minimax_h3_reference_image_short_edge is None:
@@ -2076,6 +2137,32 @@ class ServerArgs(DisaggServerArgsMixin):
                 "(fine texture, legible text, frame-accurate detail) for "
                 "latency and memory; validate quality at the tier you pick, "
                 "especially for fully_preserved references."
+            ),
+        )
+        parser.add_argument(
+            "--enable-streaming",
+            action=StoreBoolean,
+            default=ServerArgs.enable_streaming,
+            help=(
+                "MiniMax-H3 only: serve long videos by splitting one request "
+                "into back-to-back fixed-length chunks. Each chunk's last "
+                "decoded frame is re-encoded as the next chunk's fl2va "
+                "first-frame anchor, so the seam carries appearance but not "
+                "motion or audio phase. Requests opt in per call with "
+                "total_duration_seconds; without it a request keeps the "
+                "ordinary single-shot path. Incompatible with quality='high', "
+                "whose audited profile pins the single-chunk workload."
+            ),
+        )
+        parser.add_argument(
+            "--streaming-chunk-seconds",
+            type=float,
+            default=ServerArgs.streaming_chunk_seconds,
+            help=(
+                "Nominal seconds per streaming chunk (default 5.0). The 17n+5 "
+                "frame grid rounds this up, so 5.0 resolves to 124 frames "
+                "(5.1667s). Must stay inside the 4-15s single-request window. "
+                "Larger chunks mean fewer seams but more memory per chunk."
             ),
         )
         parser.add_argument(

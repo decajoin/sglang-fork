@@ -53,6 +53,22 @@ class MiniMaxH3SamplingParams(SamplingParams):
     conditions: list[dict[str, Any]] | None = None
     target: dict[str, Any] | None = None
     audio_flow_shift: float | None = None
+    # Streaming long video (requires --enable-streaming). Opting in turns the
+    # request into a chain of chunks, each an ordinary request of
+    # --streaming-chunk-seconds. target.duration_seconds keeps describing one
+    # chunk, so the 4-15s contract and every geometry path stay untouched.
+    total_duration_seconds: float | None = None
+    # One prompt per chunk, in order. None reuses `prompt` for every chunk.
+    chunk_prompts: list[str] | None = None
+    # Cross-chunk KV retention: how many whole recent chunks stay in history
+    # alongside the opening sink, and whether that sink keeps its audio.
+    streaming_kv_recent_chunks: int | None = None
+    streaming_kv_video_only_sink: bool | None = None
+    # Joined length of a streaming result, resolved by _adjust_streaming.
+    # Delivery validation runs in the API process on the queued request, so the
+    # published length has to travel with it -- the worker's own bookkeeping
+    # never comes back across the scheduler boundary.
+    streaming_published_frames: int | None = field(default=None, init=False)
     output_mode: str | None = field(
         default=None,
         metadata={"batch_sig_exclude": True},
@@ -71,6 +87,10 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "output_mode",
                 "imgvid_cond_noise_aug_for_inference",
                 "audio_cond_noise_aug_for_inference",
+                "total_duration_seconds",
+                "chunk_prompts",
+                "streaming_kv_recent_chunks",
+                "streaming_kv_video_only_sink",
             }
         )
 
@@ -182,6 +202,56 @@ class MiniMaxH3SamplingParams(SamplingParams):
         super()._adjust(server_args)
         self.fps = 24
         self.num_frames = 1
+        self._adjust_streaming(server_args)
+
+    def _adjust_streaming(self, server_args) -> None:
+        """Resolve the chunk decomposition once the server chunk size is known.
+
+        ``chunk_prompts`` has to match the resolved chunk count, and that count
+        depends on ``--streaming-chunk-seconds``, so the cross-check lives here
+        rather than in ``_validate``.
+        """
+        if self.total_duration_seconds is None:
+            if self.chunk_prompts is not None:
+                raise ValueError(
+                    "chunk_prompts requires total_duration_seconds; without it "
+                    "the request keeps the ordinary single-shot path"
+                )
+            return
+        if not getattr(server_args, "enable_streaming", False):
+            raise ValueError(
+                "total_duration_seconds requires the server to run with "
+                "--enable-streaming"
+            )
+        if getattr(self, "quality", "lossless") == "high":
+            raise ValueError(
+                'quality="high" pins the audited single-chunk workload and does '
+                "not describe a joined streaming result; use quality=\"lossless\""
+            )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+            minimax_h3_streaming_chunk_plan,
+        )
+
+        plan = minimax_h3_streaming_chunk_plan(
+            total_duration_seconds=self.total_duration_seconds,
+            chunk_seconds=float(server_args.streaming_chunk_seconds),
+        )
+        if self.chunk_prompts is not None and len(self.chunk_prompts) != (
+            plan.chunk_count
+        ):
+            raise ValueError(
+                "chunk_prompts must carry one prompt per resolved chunk: "
+                f"total_duration_seconds={self.total_duration_seconds:g} over "
+                f"{plan.chunk_duration_seconds:g}s chunks resolves to "
+                f"{plan.chunk_count} chunks, got {len(self.chunk_prompts)}"
+            )
+        # A chunk is an ordinary request internally; its own duration is what
+        # the 4-15s geometry contract sees.
+        target = dict(self.target) if isinstance(self.target, Mapping) else {}
+        target["duration_seconds"] = plan.chunk_duration_seconds
+        target.setdefault("aspect_ratio", "auto")
+        self.target = target
+        self.streaming_published_frames = plan.published_frames
 
     def _validate(self) -> None:
         self.fps = 24
@@ -199,6 +269,31 @@ class MiniMaxH3SamplingParams(SamplingParams):
         super()._validate()
         _optional_positive_finite_float(self.flow_shift, "flow_shift")
         _optional_positive_finite_float(self.audio_flow_shift, "audio_flow_shift")
+        _optional_positive_finite_float(
+            self.total_duration_seconds, "total_duration_seconds"
+        )
+        if self.chunk_prompts is not None:
+            if not isinstance(self.chunk_prompts, list) or not self.chunk_prompts:
+                raise ValueError("chunk_prompts must be a non-empty list of strings")
+            for index, prompt in enumerate(self.chunk_prompts):
+                if not isinstance(prompt, str) or not prompt.strip():
+                    raise ValueError(
+                        f"chunk_prompts[{index}] must be a non-empty string"
+                    )
+            self.chunk_prompts = [prompt.strip() for prompt in self.chunk_prompts]
+        if self.streaming_kv_recent_chunks is not None:
+            value = self.streaming_kv_recent_chunks
+            # 0 keeps the appearance sink alone, which is what makes the cache
+            # fit at 768p; kv_anchor still carries motion through the anchor frame.
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    "streaming_kv_recent_chunks must be an integer >= 0, got "
+                    f"{value!r}"
+                )
+        if self.streaming_kv_video_only_sink is not None and not isinstance(
+            self.streaming_kv_video_only_sink, bool
+        ):
+            raise ValueError("streaming_kv_video_only_sink must be a bool")
         if self.enable_frame_interpolation:
             raise ValueError(
                 "MiniMax H3 does not support enable_frame_interpolation: the "

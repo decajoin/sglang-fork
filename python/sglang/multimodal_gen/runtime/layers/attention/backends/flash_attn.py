@@ -457,7 +457,8 @@ class FlashAttentionImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
-    ) -> torch.Tensor:
+        return_softmax_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         del cu_seqlens_host
         output = flash_attn_varlen_func(
             query,
@@ -470,5 +471,13 @@ class FlashAttentionImpl(AttentionImpl):
             softmax_scale=self.softmax_scale,
             causal=self.causal,
             ver=fa_ver,
+            return_softmax_lse=return_softmax_lse,
         )
-        return output[0] if isinstance(output, tuple) else output
+        if not return_softmax_lse:
+            return output[0] if isinstance(output, tuple) else output
+        if not isinstance(output, tuple) or len(output) < 2:
+            raise RuntimeError(
+                "FlashAttention did not return a log-sum-exp for a packed "
+                "varlen call that asked for one"
+            )
+        return output[0], output[1]

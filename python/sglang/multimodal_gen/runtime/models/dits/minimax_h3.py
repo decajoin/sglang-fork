@@ -7,11 +7,14 @@ contract accepts packed inference keyword arguments and returns packed logits.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
 import os
 import struct
 from contextlib import ExitStack
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
@@ -499,6 +502,125 @@ def _attention_row_modality_tags(
     return token_tags.to(device).clamp(min=0)
 
 
+@dataclass(frozen=True)
+class MiniMaxH3StreamingAttentionState:
+    """Cross-chunk K/V wiring for one streaming DiT forward.
+
+    ``media_rows`` indexes this chunk's target media rows in the packed
+    sequence. Those rows, and only those, attend to the retained history and
+    are what a committing forward stores; text, padding and condition rows
+    belong to the chunk that produced them.
+
+    Attention sees the whole packed sequence on every rank -- Ulysses trades
+    sequence for heads inside the call -- so these are global row indices, the
+    same on every rank.
+    """
+
+    cache: Any
+    commit: bool
+    media_rows: torch.Tensor
+    commit_tags: torch.Tensor
+
+
+_streaming_attention_state: ContextVar[MiniMaxH3StreamingAttentionState | None] = (
+    ContextVar("minimax_h3_streaming_attention_state", default=None)
+)
+
+
+@contextlib.contextmanager
+def minimax_h3_streaming_attention(state: MiniMaxH3StreamingAttentionState | None):
+    """Publish cross-chunk K/V to every MiniMax H3 attention in this scope."""
+    token = _streaming_attention_state.set(state)
+    try:
+        yield
+    finally:
+        _streaming_attention_state.reset(token)
+
+
+def _minimax_h3_streaming_state_for(
+    attention: MiniMaxH3Attention,
+) -> MiniMaxH3StreamingAttentionState | None:
+    """The streaming state, if this layer participates in the chunk chain.
+
+    The two token-refiner blocks share this attention class but run the text
+    sequence with no RoPE, so their rows are not clip history and their
+    prefixes are absent from the cache's layer names.
+    """
+    state = _streaming_attention_state.get()
+    if state is None:
+        return None
+    return state if state.cache.accepts(attention.prefix) else None
+
+
+def _minimax_h3_merge_history_attention(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    q: torch.Tensor,
+    *,
+    history: tuple[torch.Tensor, torch.Tensor],
+    media_rows: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Fold attention over retained history into the media rows' output.
+
+    The two partials cover disjoint K/V sets and each is self-normalized over
+    its own, so combining them is the exact two-term logsumexp reweighting
+    that ring attention already uses to stitch its per-rank chunks. Doing it
+    this way leaves the current chunk's own attention call untouched, so rows
+    that carry no history stay bit-for-bit what they were.
+    """
+    from sglang.multimodal_gen.runtime.layers.attention.backends import flash_attn
+    from sglang.multimodal_gen.runtime.layers.usp import _ring_merge_attention
+
+    history_k, history_v = history
+    history_q = q.index_select(0, media_rows)
+    cu_q = torch.tensor(
+        [0, int(history_q.shape[0])], dtype=torch.int32, device=q.device
+    )
+    cu_k = torch.tensor(
+        [0, int(history_k.shape[0])], dtype=torch.int32, device=q.device
+    )
+    history_out, history_lse = flash_attn.flash_attn_varlen_func(
+        history_q,
+        history_k,
+        history_v,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=int(history_q.shape[0]),
+        max_seqlen_k=int(history_k.shape[0]),
+        softmax_scale=softmax_scale,
+        causal=False,
+        ver=flash_attn.fa_ver,
+        return_softmax_lse=True,
+    )[:2]
+
+    merged, merged_lse = _ring_merge_attention(
+        None, None, out.index_select(0, media_rows), lse.index_select(1, media_rows)
+    )
+    merged, _ = _ring_merge_attention(
+        merged, merged_lse, history_out, history_lse
+    )
+    return out.index_copy(0, media_rows, merged.to(out.dtype))
+
+
+def _minimax_h3_require_lse_backend(attention: MiniMaxH3Attention) -> None:
+    """Cross-chunk K/V needs a backend that reports its log-sum-exp.
+
+    History is folded in by merging two self-normalized attention partials,
+    which is only exact given each one's LSE. The sparse backends do not
+    produce one, so a streaming run fails here rather than silently attending
+    to the current chunk alone. This is checked on the first chunk, before any
+    history exists, so the run stops before it has produced anything.
+    """
+    if attention._attention_backend_enum is not AttentionBackendEnum.FA:
+        raise NotImplementedError(
+            "MiniMax H3 cross-chunk KV streaming requires the FlashAttention "
+            f"backend; {attention._attention_backend_enum} does not report the "
+            "log-sum-exp the history merge needs. Re-run with "
+            "--attention-backend fa."
+        )
+
+
 def _minimax_h3_attention_core_impl(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -553,14 +675,37 @@ def _minimax_h3_attention_core_impl(
             ring_ws=ring_ws,
         )
     else:
-        out = attention._attention_impl.forward_varlen(
+        streaming = _minimax_h3_streaming_state_for(attention)
+        if streaming is not None:
+            _minimax_h3_require_lse_backend(attention)
+        history = (
+            None if streaming is None else streaming.cache.history(attention.prefix)
+        )
+        result = attention._attention_impl.forward_varlen(
             q,
             k,
             v,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             cu_seqlens_host=cu_seqlens_host,
+            return_softmax_lse=history is not None,
         )
+        if history is None:
+            out = result
+        else:
+            out = _minimax_h3_merge_history_attention(
+                result[0],
+                result[1],
+                q,
+                history=history,
+                media_rows=streaming.media_rows.to(q.device),
+                softmax_scale=attention.softmax_scale,
+            )
+        if streaming is not None and streaming.commit:
+            rows = streaming.media_rows.to(k.device)
+            streaming.cache.stage(
+                attention.prefix, k.index_select(0, rows), v.index_select(0, rows)
+            )
     if ulysses_active:
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
     return out

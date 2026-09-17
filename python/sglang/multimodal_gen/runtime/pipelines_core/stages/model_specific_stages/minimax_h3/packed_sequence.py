@@ -128,11 +128,32 @@ def minimax_h3_packed_sequence(
     include_keyframe_cond: bool,
     keyframe_frame_indices: list[int] | tuple[int, ...] | None = None,
     frame_count: int | None = None,
+    video_latent_index_origin: int = 0,
+    audio_latent_index_origin: int = 0,
+    media_time_origin: float | None = None,
 ) -> dict[str, Any]:
     """Build the packed-sequence structural fields for one CFG branch.
 
     The used length is padded up to a multiple of 64.
+
+    The three streaming parameters place this chunk on a clip-wide RoPE
+    timeline: the media coordinates continue from the given global latent
+    indices instead of restarting, and the prompt is right-aligned so that it
+    still ends exactly where this chunk's media begins. Their defaults are a
+    standalone request, and reproduce the grid this builder has always
+    produced value for value.
     """
+    if int(video_latent_index_origin) < 0 or int(audio_latent_index_origin) < 0:
+        raise ValueError("streaming latent index origins must not be negative")
+    if video_latent_index_origin and include_keyframe_cond:
+        # A continuation only knows its past, so the one anchor it can carry is
+        # the boundary frame, which sits at this chunk's own frame zero.
+        indices = tuple(keyframe_frame_indices or ())
+        if indices != (0,):
+            raise ValueError(
+                "a streaming continuation can only anchor on its first frame, "
+                f"got keyframe_frame_indices={list(indices)}"
+            )
     ph, pw = latent_h // _PATCH_H, latent_w // _PATCH_W
     frame_rows = ph * pw
     cond_frame_indices = _keyframe_cond_frame_indices(
@@ -168,10 +189,22 @@ def minimax_h3_packed_sequence(
     audio_pos = torch.arange(audio_sl.start, audio_sl.stop)
     text_pos = torch.arange(0, text_len)
 
-    g = torch.zeros(seq_len, 3, dtype=torch.float64)
-    g[text_sl, 0] = torch.arange(text_len, dtype=torch.float64)
+    media_origin = (
+        float(text_len) if media_time_origin is None else float(media_time_origin)
+    )
+    t_grid = _video_t_grid(
+        latent_t, media_origin, latent_index_origin=video_latent_index_origin
+    )
+    # Where this chunk's media starts on the clip timeline. The prompt is
+    # right-aligned to end there, which for a standalone request puts it back
+    # at position zero.
+    media_start = float(t_grid[0])
 
-    t_grid = _video_t_grid(latent_t, float(text_len))
+    g = torch.zeros(seq_len, 3, dtype=torch.float64)
+    g[text_sl, 0] = media_start - float(text_len) + torch.arange(
+        text_len, dtype=torch.float64
+    )
+
     sqrt_area = np.sqrt(latent_h * latent_w)
     h_grid = _axis_from_sqrt_area(latent_h, _PATCH_H, sqrt_area)
     w_grid = _axis_from_sqrt_area(latent_w, _PATCH_W, sqrt_area)
@@ -186,11 +219,9 @@ def minimax_h3_packed_sequence(
             cond_sl.start + (block_index + 1) * frame_rows,
         )
         if pixel_index == 0:
-            cond_t = float(text_len)
+            cond_t = media_start
         elif frame_count is not None and pixel_index == frame_count - 1:
-            cond_t = (
-                float(text_len) + _temporal_position_span(latent_t) - _FRAME_RESCALE
-            )
+            cond_t = media_start + _temporal_position_span(latent_t) - _FRAME_RESCALE
         else:
             raise ValueError(
                 "fl2va packed layout only supports first/last keyframe anchors, "
@@ -198,7 +229,11 @@ def minimax_h3_packed_sequence(
             )
         g[sl, 0] = cond_t
         g[sl, 1:] = frame
-    audio_t_grid = float(text_len) + torch.arange(audio_t, dtype=torch.float64)
+    audio_t_grid = media_origin + torch.arange(
+        int(audio_latent_index_origin),
+        int(audio_latent_index_origin) + audio_t,
+        dtype=torch.float64,
+    )
     g[audio_sl, 0] = audio_t_grid.repeat(audio_channel)
     g[audio_sl.start : audio_sl.start + audio_t, 2] = float(w_grid[0])
     g[audio_sl.start + audio_t : audio_sl.stop, 2] = float(w_grid[-1])
@@ -253,14 +288,24 @@ def _axis_from_sqrt_area(dim: int, patch: int, sqrt_area: float) -> torch.Tensor
     return torch.from_numpy(grid).to(torch.float64)
 
 
-def _video_t_grid(n: int, origin: float) -> torch.Tensor:
+def _video_t_grid(n: int, origin: float, *, latent_index_origin: int = 0) -> torch.Tensor:
+    """Temporal RoPE coordinates for ``n`` video latents.
+
+    The per-latent span pattern is keyed on the *global* latent index, so a
+    streaming continuation that starts part-way through the clip accumulates
+    from index zero and keeps only its own tail. With the default origin the
+    accumulation, the cumsum and the slice are all exactly what a standalone
+    request has always computed.
+    """
+    total = int(latent_index_origin) + n
     spans = torch.tensor(
-        [_FRAME_RESCALE * _FRAME_PER_TOKEN[k % _T_GROUP] for k in range(n)],
+        [_FRAME_RESCALE * _FRAME_PER_TOKEN[k % _T_GROUP] for k in range(total)],
         dtype=torch.float64,
     )
-    return origin + torch.cat(
+    starts = torch.cat(
         [torch.zeros(1, dtype=torch.float64), spans[:-1].cumsum(0)]
     )
+    return origin + starts[int(latent_index_origin) :]
 
 
 def _video_t_span(n: int) -> float:

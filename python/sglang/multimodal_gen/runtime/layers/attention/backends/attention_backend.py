@@ -204,7 +204,16 @@ class AttentionImpl(ABC, Generic[T]):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
-    ) -> torch.Tensor:
+        return_softmax_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Packed varlen attention.
+
+        With ``return_softmax_lse`` the result is ``(out, lse)`` where ``lse``
+        is FlashAttention's ``[heads, tokens]`` log-sum-exp. A caller needs it
+        to merge this result with attention over a disjoint K/V set; a backend
+        that cannot produce one must raise rather than return a stand-in,
+        because a wrong LSE silently mis-weights the merge.
+        """
         raise NotImplementedError(
             f"{type(self).__name__} does not implement packed varlen attention"
         )

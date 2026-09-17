@@ -19,6 +19,9 @@ MINIMAX_H3_REFERENCE_IMAGE_ROWS_EXTRA_KEY = "minimax_h3_reference_image_rows"
 MINIMAX_H3_REFERENCE_AUDIO_ROWS_EXTRA_KEY = "minimax_h3_reference_audio_rows"
 MINIMAX_H3_REFERENCE_VIDEO_ROWS_EXTRA_KEY = "minimax_h3_reference_video_rows"
 MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY = "minimax_h3_prepared_reference_video"
+# Cross-chunk KV streaming: a MiniMaxH3StreamingChunkContext placing this
+# chunk on the clip timeline and carrying the persistent K/V cache.
+MINIMAX_H3_STREAMING_CHUNK_EXTRA_KEY = "minimax_h3_streaming_chunk"
 
 MINIMAX_H3_SUPPORTED_FPS = 24
 MINIMAX_H3_MIN_DURATION_SECONDS = 4.0

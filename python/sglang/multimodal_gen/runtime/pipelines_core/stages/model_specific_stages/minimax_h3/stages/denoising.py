@@ -680,6 +680,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         )
 
         ctx = _resolve_full_loop_context(batch)
+        stream = _resolve_streaming_chunk_context(batch)
 
         if not torch.cuda.is_available():
             raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA")
@@ -693,7 +694,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         _assemble_condition_rows(ctx)
 
         emb = ctx.embeddings["positive"]
-        packed = _build_packed_layout(ctx, emb)
+        packed = _build_packed_layout(ctx, emb, stream)
         tags = packed["token_tags"]
         tags[packed["text_pos"].view(-1)] = (
             emb["text_token_tags"].view(-1).to(torch.long)
@@ -734,8 +735,14 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device=device,
             )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
+            streaming_rows = (
+                None if stream is None else _streaming_media_rows(positive)
+            )
             with (
                 maybe_nvtx_range("denoising_loop", self.current_use_nvtx),
+                # Cross-chunk history: readable by every denoise forward,
+                # written only by the dedicated clean forward below.
+                _streaming_attention_ctx(stream, streaming_rows, commit=False),
                 # The loop runs len(sigmas_video) - 1 forwards; that count is
                 # authoritative here and nowhere else, and sparge_attn's tail
                 # cutoff cannot identify the last step without it.
@@ -774,6 +781,19 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         batch=batch,
                     ),
                 )
+            if stream is not None:
+                assert streaming_rows is not None
+                video_rows, audio_rows = self._commit_streaming_chunk(
+                    model,
+                    positive,
+                    batch=batch,
+                    stream=stream,
+                    streaming_rows=streaming_rows,
+                    video_rows=video_rows,
+                    audio_rows=audio_rows,
+                    imgvid_noise_aug=float(imgvid_noise_aug),
+                    audio_noise_aug=float(audio_noise_aug),
+                )
         finally:
             self._finish_active_component_use()
         _publish_full_loop_outputs(
@@ -783,6 +803,71 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             video_rows=video_rows,
             audio_rows=audio_rows,
         )
+
+    def _commit_streaming_chunk(
+        self,
+        model: Any,
+        positive: Any,
+        *,
+        batch: Req,
+        stream: Any,
+        streaming_rows: tuple[torch.Tensor, torch.Tensor],
+        video_rows: torch.Tensor,
+        audio_rows: torch.Tensor,
+        imgvid_noise_aug: float,
+        audio_noise_aug: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize this chunk's clean rows, then publish their K/V.
+
+        The rows committed are the ones that will also be decoded, so the
+        history describes what the clip actually shows rather than the raw
+        denoise output.
+
+        The extra forward is what makes the K/V clean: the loop's last forward
+        still saw a noisy input, and caching those keys would hand every later
+        chunk a description of noise. ``sigma = 0`` is ``t = 1.0`` here.
+        """
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.streaming_kv import (
+            minimax_h3_renormalize_video_rows,
+        )
+
+        target = positive.video_target_slice
+        video_rows[target] = minimax_h3_renormalize_video_rows(
+            video_rows[target], stream
+        )
+
+        clean_step = positive.prepare_timestep_plan(
+            video_timesteps=[1.0],
+            audio_timesteps=[1.0],
+            imgvid_cond_noise_aug=imgvid_noise_aug,
+            audio_ref_cond_noise_aug=audio_noise_aug,
+        )[0]
+        # The loop filled the AdaLN cache for its own steps only; a lookup for
+        # an unplanned timestep would miss.
+        model.prepare_adaln_plans([clean_step[0]])
+        call_kwargs = positive.forward_kwargs(
+            video_rows=video_rows,
+            audio_rows=audio_rows,
+            step_timesteps=clean_step,
+        )
+
+        _media_rows, commit_tags = streaming_rows
+        stream.cache.begin_commit(commit_tags)
+        try:
+            with (
+                maybe_nvtx_range("streaming_kv_commit", self.current_use_nvtx),
+                _streaming_attention_ctx(stream, streaming_rows, commit=True),
+                torch.inference_mode(),
+            ):
+                self._forward_dit(model, call_kwargs, 0, batch=batch)
+        except BaseException:
+            stream.cache.rollback()
+            raise
+        stream.cache.commit()
+        stream.cache.retain_sink_and_recent(
+            stream.recent_chunks, video_only_sink=stream.video_only_sink
+        )
+        return video_rows, audio_rows
 
     @contextmanager
     def _profile_denoising_step(self, step_index: int, *, batch: Req):
@@ -946,11 +1031,74 @@ def _assemble_condition_rows(ctx: _FullLoopContext) -> None:
         ctx.keyframe_frame_count = int(ctx.keyframe["frame_count"])
 
 
+def _resolve_streaming_chunk_context(batch: Req) -> Any | None:
+    """The cross-chunk KV context for this chunk, or None outside streaming."""
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+        MINIMAX_H3_STREAMING_CHUNK_EXTRA_KEY,
+    )
+
+    return batch.extra.get(MINIMAX_H3_STREAMING_CHUNK_EXTRA_KEY)
+
+
+def _streaming_media_rows(positive: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    """This chunk's target media rows, and the modality tag of each.
+
+    Condition and reference rows are excluded: they restate something an
+    earlier chunk already generated, so committing them would double-count it
+    in the history.
+    """
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.streaming_kv import (
+        MINIMAX_H3_AUDIO_TOKEN_TAG,
+        MINIMAX_H3_VIDEO_TOKEN_TAG,
+    )
+
+    video = positive.img_target_seq_idx.to(torch.long)
+    audio = positive.audio_target_seq_idx.to(torch.long)
+    rows = torch.cat((video, audio))
+    tags = torch.cat(
+        (
+            torch.full((int(video.numel()),), MINIMAX_H3_VIDEO_TOKEN_TAG, dtype=torch.long),
+            torch.full((int(audio.numel()),), MINIMAX_H3_AUDIO_TOKEN_TAG, dtype=torch.long),
+        )
+    )
+    return rows, tags
+
+
+def _streaming_attention_ctx(
+    stream: Any | None,
+    streaming_rows: tuple[torch.Tensor, torch.Tensor] | None,
+    *,
+    commit: bool,
+):
+    """Publish cross-chunk K/V to the DiT for the scope of one call."""
+    if stream is None or streaming_rows is None:
+        return nullcontext()
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+        MiniMaxH3StreamingAttentionState,
+        minimax_h3_streaming_attention,
+    )
+
+    media_rows, commit_tags = streaming_rows
+    return minimax_h3_streaming_attention(
+        MiniMaxH3StreamingAttentionState(
+            cache=stream.cache,
+            commit=commit,
+            media_rows=media_rows,
+            commit_tags=commit_tags,
+        )
+    )
+
+
 def _build_packed_layout(
     ctx: _FullLoopContext,
     emb: Mapping[str, Any],
+    stream: Any | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Build the per-task packed layout for the positive branch."""
+    """Build the per-task packed layout for the positive branch.
+
+    With ``stream`` the media coordinates continue the clip timeline instead
+    of restarting at this chunk's prompt.
+    """
 
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
         minimax_h3_packed_sequence,
@@ -970,18 +1118,39 @@ def _build_packed_layout(
             text_visuals=emb.get("text_visual_spans") or (),
         )
     else:
-        packed = minimax_h3_packed_sequence(
-            text_len=int(emb["text_len"]),
-            latent_t=ctx.latent_t,
-            latent_h=ctx.latent_h,
-            latent_w=ctx.latent_w,
-            audio_t=ctx.audio_t,
-            include_keyframe_cond=ctx.include_cond,
-            keyframe_frame_indices=(
-                ctx.keyframe_frame_indices if ctx.include_cond else None
-            ),
-            frame_count=ctx.keyframe_frame_count,
-        )
+        if stream is None:
+            packed = minimax_h3_packed_sequence(
+                text_len=int(emb["text_len"]),
+                latent_t=ctx.latent_t,
+                latent_h=ctx.latent_h,
+                latent_w=ctx.latent_w,
+                audio_t=ctx.audio_t,
+                include_keyframe_cond=ctx.include_cond,
+                keyframe_frame_indices=(
+                    ctx.keyframe_frame_indices if ctx.include_cond else None
+                ),
+                frame_count=ctx.keyframe_frame_count,
+            )
+        else:
+            # The first chunk defines the clip's media origin; every later one
+            # measures from it so media positions never restart.
+            if stream.media_time_origin is None:
+                stream.media_time_origin = float(emb["text_len"])
+            packed = minimax_h3_packed_sequence(
+                text_len=int(emb["text_len"]),
+                latent_t=ctx.latent_t,
+                latent_h=ctx.latent_h,
+                latent_w=ctx.latent_w,
+                audio_t=ctx.audio_t,
+                include_keyframe_cond=ctx.include_cond,
+                keyframe_frame_indices=(
+                    ctx.keyframe_frame_indices if ctx.include_cond else None
+                ),
+                frame_count=ctx.keyframe_frame_count,
+                video_latent_index_origin=stream.video_latent_index_origin,
+                audio_latent_index_origin=stream.audio_latent_index_origin,
+                media_time_origin=stream.media_time_origin,
+            )
     return packed
 
 

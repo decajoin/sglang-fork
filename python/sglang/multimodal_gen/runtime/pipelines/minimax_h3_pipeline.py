@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MiniMaxH3DecodingStage,
     MiniMaxH3DenoisingStage,
     MiniMaxH3LatentPreparationStage,
+    MiniMaxH3StreamingChunkStage,
     MiniMaxH3TextEncodingStage,
     MiniMaxH3TimestepPreparationStage,
     MiniMaxH3VisualEncodingStage,
@@ -110,13 +111,12 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(InputValidationStage())
         if release_metadata is not None:
             self.add_stage(MiniMaxH3PartitionAdmissionStage(release_metadata))
-        self.add_stage(
-            MiniMaxH3TextEncodingStage(
-                text_encoder=self.get_module("text_encoder"),
-                tokenizer=self.get_module("tokenizer"),
-                processor=self.get_module("processor"),
-            )
+        text_encoding = MiniMaxH3TextEncodingStage(
+            text_encoder=self.get_module("text_encoder"),
+            tokenizer=self.get_module("tokenizer"),
+            processor=self.get_module("processor"),
         )
+        self.add_stage(text_encoding)
         self.add_stage(
             MiniMaxH3VisualEncodingStage(
                 video_vae=self.get_module("video_vae"),
@@ -129,22 +129,37 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 vae_arch_config=server_args.pipeline_config.audio_vae_config.arch_config,
             )
         )
-        self.add_stage(MiniMaxH3LatentPreparationStage())
-        self.add_stage(
-            MiniMaxH3TimestepPreparationStage(
-                sigma_shift_scales=sigma_shift_scales,
-            )
+        latent_preparation = MiniMaxH3LatentPreparationStage()
+        timestep_preparation = MiniMaxH3TimestepPreparationStage(
+            sigma_shift_scales=sigma_shift_scales,
         )
-        self.add_stage(
-            MiniMaxH3DenoisingStage(
-                transformer=self.get_module("transformer"),
-                pipeline=self,
-            )
+        denoising = MiniMaxH3DenoisingStage(
+            transformer=self.get_module("transformer"),
+            pipeline=self,
         )
+        decoding = MiniMaxH3DecodingStage(
+            video_vae=self.get_module("video_vae"),
+            audio_vae=self.get_module("audio_vae"),
+        )
+        if not server_args.enable_streaming:
+            self.add_stage(latent_preparation)
+            self.add_stage(timestep_preparation)
+            self.add_stage(denoising)
+            self.add_stage(decoding)
+            return
+        # One stage owns the chunk loop: the executor runs the stage list
+        # exactly once per request, so repetition has to live inside a stage.
+        # Requests that do not ask for a long video still take the plain
+        # four-stage sequence inside it.
         self.add_stage(
-            MiniMaxH3DecodingStage(
+            MiniMaxH3StreamingChunkStage(
+                text_encoding=text_encoding,
+                latent_preparation=latent_preparation,
+                timestep_preparation=timestep_preparation,
+                denoising=denoising,
+                decoding=decoding,
                 video_vae=self.get_module("video_vae"),
-                audio_vae=self.get_module("audio_vae"),
+                vae_arch_config=server_args.pipeline_config.vae_config.arch_config,
             )
         )
 
