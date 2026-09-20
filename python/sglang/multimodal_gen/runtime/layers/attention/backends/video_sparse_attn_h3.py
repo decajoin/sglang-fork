@@ -357,6 +357,40 @@ def _dit_layer_index(prefix: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _balanced_chunk(heads: int, widest: int) -> int:
+    """The evenest slice that still runs in as few passes as ``widest`` does.
+
+    The widest slice the budget allows is not the cheapest one: at 28 heads a
+    ceiling of 27 runs 27 then 1, and the peak is sized by that first pass
+    while the second does almost nothing. Fourteen and fourteen is the same
+    two passes for half the transient.
+
+    What that buys is peak memory, and the amount is modest. Measured on one
+    RTX 5090 at 28 heads and the 512 MiB default budget, on the grids where
+    the two widths differ at all -- half of them do not, and there the two are
+    the same number: 1249 MiB against 1166 at ``(17, 60, 106)``, 1091 against
+    1004 at ``(21, 48, 85)``, 1335 against 1292 at ``(30, 48, 85)``, 1624
+    against 1562 at ``(40, 48, 85)``, so 3% to 8% off the call's peak. With
+    INT8 Q.K off the key buffer doubles, the budget slices more finely and the
+    unevenness costs more: 892 against 699 at ``(10, 54, 96)``, 879 against
+    727 at ``(13, 48, 85)``, 17% to 22%. Time is a wash either way, the launch
+    count trading against how much work each launch has to fill the GPU with.
+
+    Slicing is not bit-exact and never was: the pooled scores are a batched
+    GEMM whose batch is the slice width, cuBLAS picks by batch size, and the
+    last bits move enough to flip a near-tie in top-k -- 3 to 45 of 23520
+    query tiles at 28 heads. The output moves by one bf16 ULP, 2e-5 to 4e-5 of
+    its norm, against the 1.3e-2 the INT8 path already spends. Changing the
+    width changes which of those a deployment gets; ``{"head_chunk": n}``
+    pins one.
+
+    Never wider than ``widest``, so the budget still holds, and never more
+    passes than ``widest`` would run, so nothing is paid for the evenness.
+    """
+    passes = math.ceil(heads / widest)
+    return math.ceil(heads / passes)
+
+
 def compute_topk(sparsity: float, num_tiles: int) -> int:
     """Visual key tiles kept per query tile, clamped to [1, num_tiles]."""
     return max(1, min(math.ceil((1 - sparsity) * num_tiles), num_tiles))
@@ -1017,7 +1051,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
             + video_tiles * (chosen + geometry.num_prefix_tiles) * 4  # the list
         )
         budget = self.schedule.head_chunk_budget_mib * 1024 * 1024
-        return max(1, min(heads, budget // max(per_head, 1)))
+        return _balanced_chunk(heads, max(1, min(heads, budget // max(per_head, 1))))
 
     def _head_slices(self, heads: int, chunk: int) -> Iterator[tuple[int, int]]:
         if chunk >= heads:

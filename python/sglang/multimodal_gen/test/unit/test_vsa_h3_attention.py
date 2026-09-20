@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h
     VideoSparseAttentionH3Impl,
     VsaH3Schedule,
     VsaH3SequenceGeometry,
+    _balanced_chunk,
     _dit_layer_index,
     _split_text_visuals,
     _tile_geometry,
@@ -81,6 +82,7 @@ def _text_geometry(**overrides) -> VsaH3SequenceGeometry:
         text_visuals=TEXT_VISUALS,
         **overrides,
     )
+
 
 _SERVER_ARGS = "sglang.multimodal_gen.runtime.server_args.get_global_server_args"
 _FORWARD_CTX = (
@@ -458,9 +460,7 @@ class TestVsaH3ReferenceTiling(unittest.TestCase):
         index = self.tiles.scatter_index[still_start : still_start + still_rows]
         self.assertEqual(int(torch.unique(index).numel()), still_rows)
         # Every one of them lands in a picture tile, never a protected one.
-        self.assertTrue(
-            bool((index // BLOCK >= self.tiles.num_prefix_tiles).all())
-        )
+        self.assertTrue(bool((index // BLOCK >= self.tiles.num_prefix_tiles).all()))
 
     def test_protecting_references_restores_the_old_tiling(self):
         protected = _tile_geometry(REF_PREFIX, VIDEO_GRID, self.device)
@@ -511,9 +511,7 @@ class TestVsaH3TextVisualSplit(unittest.TestCase):
         """Timestamp text splits the blocks, so they cannot be one volume."""
         block = (1, 8, 16)
         rows = math.prod(block)
-        spans = tuple(
-            (16 + index * (rows + 4), rows, block) for index in range(3)
-        )
+        spans = tuple((16 + index * (rows + 4), rows, block) for index in range(3))
         text_len = 16 + 3 * (rows + 4)
         segments, pictures, _ = _split_text_visuals((text_len, 300), (), spans)
         # timestamp | block | timestamp | block | timestamp | block | tail
@@ -538,9 +536,7 @@ class TestVsaH3TextVisualSplit(unittest.TestCase):
             TEXT_SPLIT_PICTURES + TEXT_SPLIT_REFERENCES,
         )
         moved = TEXT_VISUALS[0][1] // BLOCK
-        self.assertEqual(
-            sparsified.num_video_tiles, protected.num_video_tiles + moved
-        )
+        self.assertEqual(sparsified.num_video_tiles, protected.num_video_tiles + moved)
 
     def test_a_text_picture_is_cut_on_its_own_grid(self):
         """A one-frame Qwen block takes the spatial tile, not the 4-frame cube."""
@@ -586,19 +582,13 @@ class TestVsaH3TextVisualNumerics(unittest.TestCase):
 
     def test_it_is_off_by_default(self):
         default = self._run(_make_impl(self._config()))
-        protected = self._run(
-            _make_impl(self._config(sparsify_text_visuals=False))
-        )
+        protected = self._run(_make_impl(self._config(sparsify_text_visuals=False)))
         torch.testing.assert_close(default, protected, atol=0, rtol=0)
 
     def test_switching_it_on_computes_something_else(self):
         protected = self._run(_make_impl(self._config()))
-        sparsified = self._run(
-            _make_impl(self._config(sparsify_text_visuals=True))
-        )
-        self.assertFalse(
-            torch.allclose(protected, sparsified, atol=2e-3, rtol=2e-2)
-        )
+        sparsified = self._run(_make_impl(self._config(sparsify_text_visuals=True)))
+        self.assertFalse(torch.allclose(protected, sparsified, atol=2e-3, rtol=2e-2))
 
     def test_leaving_it_off_ignores_the_published_spans(self):
         """``false`` must be exactly the behaviour before the spans existed."""
@@ -613,9 +603,7 @@ class TestVsaH3TextVisualNumerics(unittest.TestCase):
         )
 
     def test_zero_sparsity_reproduces_dense_attention(self):
-        impl = _make_impl(
-            self._config(sparsity=0.0, sparsify_text_visuals=True)
-        )
+        impl = _make_impl(self._config(sparsity=0.0, sparsify_text_visuals=True))
         torch.testing.assert_close(
             self._run(impl),
             _dense_ref(self.q, self.k, self.v),
@@ -708,7 +696,7 @@ class TestVsaH3HeadChunking(unittest.TestCase):
         the budget under the full accounting it fits under a subset of it, and
         the test does not then have to restate the implementation's formula.
         """
-        return tiles.padded_rows * HEAD_DIM * 1 + tiles.num_tiles**2 * 4
+        return tiles.padded_rows * HEAD_DIM * 1 + tiles.num_video_tiles**2 * 4
 
     def test_the_slice_stays_inside_the_budget(self):
         impl = _make_impl()
@@ -740,6 +728,26 @@ class TestVsaH3HeadChunking(unittest.TestCase):
         impl = _make_impl({"head_chunk_budget_mib": 1})
         self.assertEqual(impl._head_chunk_for(self.long, 28, itemsize=2), 1)
 
+    def test_the_slice_is_balanced_not_merely_widest(self):
+        """The widest slice the budget allows is not the cheapest one.
+
+        28 heads at a ceiling of 8 is 8, 8, 8, 4 -- four passes either way, but
+        the peak is sized by the full pass and the ragged one adds nothing to
+        it. Four passes of 7 have a lower peak for the same launches.
+        """
+        self.assertEqual(_balanced_chunk(28, 8), 7)
+        self.assertEqual(_balanced_chunk(28, 12), 10)
+        self.assertEqual(_balanced_chunk(28, 21), 14)
+        for heads in (1, 4, 14, 28, 56):
+            for widest in range(1, heads + 1):
+                chunk = _balanced_chunk(heads, widest)
+                with self.subTest(heads=heads, widest=widest):
+                    # never over the ceiling, and never more passes than it
+                    self.assertLessEqual(chunk, widest)
+                    self.assertEqual(
+                        math.ceil(heads / chunk), math.ceil(heads / widest)
+                    )
+
     def test_compete_sizing_tracks_the_sparsity(self):
         """``compete`` selects ``topk + n_prefix`` tiles, so topk sizes it.
 
@@ -749,6 +757,7 @@ class TestVsaH3HeadChunking(unittest.TestCase):
         errs safe -- the cost is launches, not an OOM -- which is exactly why
         nothing else would catch it.
         """
+
         def chunk(sparsity):
             impl = _make_impl({"prefix_mode": "compete", "sparsity": sparsity})
             return impl._head_chunk_for(self.long, 28, itemsize=2)
