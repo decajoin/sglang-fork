@@ -104,13 +104,20 @@ class _Ctx:
         self.forward_batch = None
 
 
-def _make_impl(config=None, *, prefix="blocks.5.attn", causal=False, num_kv_heads=None):
+def _make_impl(
+    config=None,
+    *,
+    prefix="blocks.5.attn",
+    causal=False,
+    num_kv_heads=None,
+    softmax_scale=HEAD_DIM**-0.5,
+):
     with patch(_SERVER_ARGS, return_value=_FakeServerArgs(config or {})):
         return VideoSparseAttentionH3Impl(
             num_heads=NUM_HEADS,
             head_size=HEAD_DIM,
             causal=causal,
-            softmax_scale=HEAD_DIM**-0.5,
+            softmax_scale=softmax_scale,
             num_kv_heads=num_kv_heads,
             prefix=prefix,
         )
@@ -733,6 +740,21 @@ class TestVsaH3HeadChunking(unittest.TestCase):
         impl = _make_impl({"head_chunk_budget_mib": 1})
         self.assertEqual(impl._head_chunk_for(self.long, 28, itemsize=2), 1)
 
+    def test_compete_sizing_tracks_the_sparsity(self):
+        """``compete`` selects ``topk + n_prefix`` tiles, so topk sizes it.
+
+        Asserted through the sparsity rather than against a restated formula:
+        an estimate that priced the selection at every tile instead would be
+        independent of topk and so identical at both ends of this range. It
+        errs safe -- the cost is launches, not an OOM -- which is exactly why
+        nothing else would catch it.
+        """
+        def chunk(sparsity):
+            impl = _make_impl({"prefix_mode": "compete", "sparsity": sparsity})
+            return impl._head_chunk_for(self.long, 28, itemsize=2)
+
+        self.assertLess(chunk(0.5), chunk(0.95))
+
 
 @requires_gpu
 class TestVsaH3Numerics(unittest.TestCase):
@@ -780,6 +802,64 @@ class TestVsaH3Numerics(unittest.TestCase):
                         self.q, self.k, self.v, self.geometry, sparsity, mode
                     )
                     torch.testing.assert_close(out, reference, atol=2e-3, rtol=2e-2)
+
+    def test_the_callers_softmax_scale_reaches_the_kernel(self):
+        """The sparse path scales logits the way the impl was told to.
+
+        The dense fallback this backend keeps for the excluded steps takes the
+        scale from the same argument, so a sparse path that substituted
+        ``1/sqrt(d)`` would make one layer compute two different functions
+        either side of the warmup cutoff, with nothing raised.
+        """
+        scale = 0.25
+        self.assertNotAlmostEqual(scale, HEAD_DIM**-0.5)
+        impl = _make_impl(
+            {
+                "sparsity": 0.0,
+                "skip_first_steps": 0,
+                "min_seq_len": 64,
+                "quantize": False,
+            },
+            softmax_scale=scale,
+        )
+        qq, kk, vv = (t.transpose(0, 1).unsqueeze(0) for t in (self.q, self.k, self.v))
+
+        def dense(sm_scale):
+            return F.scaled_dot_product_attention(qq, kk, vv, scale=sm_scale)[
+                0
+            ].transpose(0, 1)
+
+        out = self._run(impl)
+        # A sharper softmax than the default concentrates more mass on fewer
+        # keys, so the bf16 output carries a little more rounding than the
+        # other numerics tests here budget for.
+        torch.testing.assert_close(out, dense(scale), atol=5e-3, rtol=2e-2)
+        # The negative control: the default scale is not what was asked for,
+        # and at 0.0 sparsity the two references are far apart.
+        self.assertGreater(
+            (out.float() - dense(HEAD_DIM**-0.5).float()).abs().max().item(), 0.1
+        )
+
+    def test_fp8_pv_survives_a_head_whose_values_are_all_zero(self):
+        """A zero head has a zero amax, and the fp8 scale divides by it.
+
+        Unreachable with trained weights and free to guard, and the failure is
+        the worst kind: a silent NaN across every row of that head, carried
+        into the residual stream rather than raised.
+        """
+        value = self.v.clone()
+        value[:, 1] = 0.0
+        impl = _make_impl(
+            {
+                "sparsity": 0.9,
+                "skip_first_steps": 0,
+                "min_seq_len": 64,
+                "quantize_pv": True,
+            }
+        )
+        out = self._run(impl, v=value)
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertEqual(out[:, 1].abs().max().item(), 0.0)
 
     def test_head_chunking_is_exact(self):
         """Selection is head-parallel, so slicing must change nothing."""

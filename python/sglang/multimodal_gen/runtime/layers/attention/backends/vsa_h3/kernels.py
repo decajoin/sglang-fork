@@ -42,8 +42,6 @@ the output's norm at any sparsity -- SageAttention's own budget, and the same
 error the dense fallback (``sage_attn``) already carries.
 """
 
-import math
-
 import torch
 import triton
 import triton.language as tl
@@ -134,7 +132,13 @@ def _quantize_tiles(
         # One scale per head, supplied by the caller: e4m3 carries its own
         # exponent, so a shared scale costs no mantissa precision, and a
         # loop-invariant scale is what keeps the P.V accumulation fused.
+        #
+        # Guarded the same way the computed scale below is: a head whose whole
+        # tensor is zero has an amax of zero, and 0/0 would put a NaN in every
+        # row of it. The stand-in only has to be positive -- the values it
+        # divides are zero, so any of them quantizes to zero either way.
         scale = tl.load(Scale + head)
+        scale = tl.where(scale > 0, scale, 1.0)
         tl.store(
             Out
             + head * stride_oh
@@ -402,6 +406,7 @@ def block_sparse_attn_forward(
     key_scale: torch.Tensor | None = None,
     value_scale: torch.Tensor | None = None,
     value_mean: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
 ) -> torch.Tensor:
     """Block-sparse attention for one contiguous run of query tiles.
 
@@ -420,6 +425,11 @@ def block_sparse_attn_forward(
     ``q_tile_offset`` is where those tiles start in the absolute tile numbering.
     Only the rows of the covered tiles are written, so two launches can fill one
     output.
+
+    ``softmax_scale`` defaults to ``1 / sqrt(head_dim)``. It is the caller's
+    because the impl that owns this kernel is handed one, and a kernel that
+    quietly substituted its own default would make the sparse path compute a
+    different function from the dense fallback the same impl falls back to.
     """
     heads, kv_len, dim = key_tiled.shape
     q_tiles = q2k_num.shape[-1]
@@ -450,7 +460,7 @@ def block_sparse_attn_forward(
         value_scale if quantized_pv else value,
         value_mean if quantized_pv else value,
         out,
-        1.0 / math.sqrt(dim),
+        dim**-0.5 if softmax_scale is None else float(softmax_scale),
         tile_rows,
         q2k_index,
         q2k_num,

@@ -14,7 +14,7 @@ sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant t2va \
   --attention-backend video_sparse_attn_h3 \
   --component-attention-backends text_encoder=fa \
   --attention-backend-config '{"sparsity": 0.9, "prefix_mode": "exempt",
-                               "skip_first_steps": 10, "skip_first_layers": 0,
+                               "skip_first_steps": 0, "skip_first_layers": 0,
                                "min_seq_len": 4096}'
 ```
 
@@ -118,7 +118,7 @@ to flip.
 | --- | ---: | --- |
 | `sparsity` | 0.9 | video key tiles dropped per video query tile. `VSA_sparsity` is accepted as an alias |
 | `prefix_mode` | `exempt` | `exempt` keeps every prefix key for free; `compete` makes them compete inside a budget of `k + n_prefix` tiles |
-| `skip_first_steps` | 10 | leading denoise forwards kept dense |
+| `skip_first_steps` | 0 | leading denoise forwards kept dense |
 | `skip_last_steps` | 0 | trailing denoise forwards kept dense (needs the schedule length, which the H3 denoising stage publishes) |
 | `skip_first_layers` | 0 | leading DiT blocks kept dense |
 | `dense_layers` | `[]` | individual DiT blocks kept dense |
@@ -192,9 +192,11 @@ VSA is a *trainable* sparse attention. FastVideo runs it at `sparsity=0.9`
 against a VSA-distilled checkpoint, where 0.9 is the policy the student was
 trained under; that checkpoint also wants `skip_first_steps=0`. Against a stock
 MiniMax-H3 checkpoint the same setting is training-free block sparsity and its
-quality is unmeasured here — which is why the warmup cutoff defaults to the
-same 10 steps every other sparse backend in this tree uses. Measure against a
-dense render before trusting a sparsity.
+quality is unmeasured here, and the warmup cutoff that would hedge against that
+is off by default: every denoise step sparsifies. `subblock_sparse` measured on
+this same model that a warmup of 5 of 50 halves cosine against the dense render
+where 10 does not, so `{"skip_first_steps": 10}` is the conservative schedule if
+a render needs it. Measure against a dense render before trusting a sparsity.
 
 ## Files
 

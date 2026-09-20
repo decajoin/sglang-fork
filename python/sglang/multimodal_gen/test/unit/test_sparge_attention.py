@@ -144,7 +144,7 @@ class TestSpargeSchedule(unittest.TestCase):
         with patch(_SERVER_ARGS, return_value=_FakeServerArgs({})):
             schedule = SpargeSchedule.from_server_args()
         self.assertEqual(schedule.topk, 0.5)
-        self.assertEqual(schedule.skip_first_steps, 10)
+        self.assertEqual(schedule.skip_first_steps, 0)
         # The tail cutoff is unmeasured on this model, so it ships off.
         self.assertEqual(schedule.skip_last_steps, 0)
         self.assertEqual(schedule.skip_first_layers, 0)

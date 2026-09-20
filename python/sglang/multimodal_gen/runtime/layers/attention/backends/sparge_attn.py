@@ -81,12 +81,16 @@ SPARGE_SUPPORTED_HEAD_DIMS = (64, 128)
 # attention is only part of a denoise step, so end-to-end gain is much smaller
 # and shrinks further at shorter sequences.
 DEFAULT_TOPK = 0.5
-# Leading denoise forwards kept dense. Carried over from the subblock_sparse
-# schedule, which measured on this same model that lowering it from 10 to 5
-# halves cosine against the dense render and visibly re-frames the shot. It has
-# not been re-swept for this backend's block map -- treat 10 as a starting
-# point, not a measured optimum for SpargeAttn.
-DEFAULT_SKIP_FIRST_STEPS = 10
+# Leading denoise forwards kept dense. 0: every step sparsifies.
+#
+# The measurement that argued for a warmup is subblock_sparse's, on this same
+# model: lowering it from 10 of 50 to 5 halves cosine against the dense render
+# and visibly re-frames the shot. It was never re-swept for this backend's
+# block map, so it was a starting point rather than a measured optimum for
+# SpargeAttn, and the first fifth of the schedule is an expensive hedge to
+# carry untested. Set ``{"skip_first_steps": 10}`` to get it back, and measure
+# against a dense render before trusting either default.
+DEFAULT_SKIP_FIRST_STEPS = 0
 # Trailing denoise forwards kept dense. Off by default: unlike the warmup
 # cutoff this one has not been measured on this model, and the two arguments
 # for it point in opposite directions.
@@ -534,12 +538,12 @@ class SpargeAttentionImpl(AttentionImpl):
     def _warn_if_the_cutoffs_swallow_the_schedule(self, total: int | None) -> None:
         """The two step cutoffs together can leave no sparse step at all.
 
-        The default warmup cutoff of 10 assumes the 50-step schedule. Turbo
-        LoRAs run 9 or 5 steps, where every index is below the cutoff and this
-        backend silently degrades into plain SageAttention. Adding a tail
-        cutoff makes the same mistake reachable from the other end. Either way
-        it is a config error worth a line in the log rather than an unexplained
-        absence of speedup.
+        Unreachable on the defaults, which keep no step dense. A warmup sized
+        for the 50-step schedule and then served against a turbo LoRA -- 9 or 5
+        steps, every index below the cutoff -- silently degrades this backend
+        into plain SageAttention. Adding a tail cutoff makes the same mistake
+        reachable from the other end. Either way it is a config error worth a
+        line in the log rather than an unexplained absence of speedup.
         """
         if total is None:
             return

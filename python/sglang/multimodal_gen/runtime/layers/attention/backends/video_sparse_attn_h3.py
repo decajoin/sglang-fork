@@ -46,9 +46,9 @@ what the sparse branch computes here.
 runs it at ``sparsity=0.9`` against a VSA-distilled checkpoint where 0.9 is the
 policy the student was trained under. Against a stock MiniMax-H3 checkpoint the
 same setting is training-free block sparsity and its quality is unmeasured
-here, which is why the warmup cutoff defaults to the same 10 steps every other
-sparse backend in this tree uses. Measure against a dense render before
-trusting a sparsity.
+here, and the warmup cutoff that would hedge against that is off by default
+(``DEFAULT_SKIP_FIRST_STEPS``). Measure against a dense render before trusting
+a sparsity.
 
 Configured through ``--attention-backend-config``::
 
@@ -144,12 +144,19 @@ assert math.prod(_FRAME_TILE_SIZE) == BLOCK_SIZE
 # 28 heads 7.58x and 11.07x. Op-level numbers: attention is only part of a
 # denoise step, so the end-to-end gain is smaller.
 DEFAULT_SPARSITY = 0.9
-# Leading denoise forwards kept dense. The early steps settle the layout of the
-# sample and tolerate approximation badly. 10 of 50 is what subblock_sparse
-# measured on this same model (lowering it to 5 halves cosine against the dense
-# render and visibly re-frames the shot) and what sparge_attn carries. A
-# VSA-distilled checkpoint trained at this sparsity wants 0 instead.
-DEFAULT_SKIP_FIRST_STEPS = 10
+# Leading denoise forwards kept dense. 0: every step sparsifies.
+#
+# This is a deliberate departure from the one measurement in this tree that
+# speaks to it. subblock_sparse measured on this same model that lowering the
+# warmup from 10 of 50 to 5 halves cosine against the dense render and visibly
+# re-frames the shot, and the early steps are where the sample's layout is
+# settled and approximation is tolerated worst. The default is 0 all the same:
+# a warmup gives back the whole first fifth of the schedule, the cutoff was
+# never re-swept for this backend's block map, and a VSA-distilled checkpoint
+# trained at this sparsity wants 0 anyway. Set ``{"skip_first_steps": 10}`` for
+# the measured-conservative schedule, and measure a render before trusting
+# either one on a new checkpoint.
+DEFAULT_SKIP_FIRST_STEPS = 0
 # Trailing denoise forwards kept dense. Off by default, and it needs the
 # schedule length: denoising absorbs a mid-schedule error by re-denoising from
 # the perturbed latent, but nothing follows the last step, so what the block
@@ -899,11 +906,11 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
     def _warn_if_the_cutoffs_swallow_the_schedule(self, total: int | None) -> None:
         """The two step cutoffs together can leave no sparse step at all.
 
-        The warmup default of 10 assumes the 50-step schedule. A VSA-distilled
-        or turbo checkpoint runs 4 to 9 steps, where every index is below the
-        cutoff and this backend silently degrades into dense attention -- a
-        config error worth a line in the log rather than an unexplained absence
-        of speedup.
+        Unreachable on the defaults, which keep no step dense. A run that sets
+        a warmup sized for the 50-step schedule and then serves a VSA-distilled
+        or turbo checkpoint -- 4 to 9 steps, every index below the cutoff --
+        silently degrades into dense attention, which is a config error worth a
+        line in the log rather than an unexplained absence of speedup.
         """
         if total is None:
             return
@@ -999,7 +1006,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         # over the chosen width, an int32 copy of those indices, and the list
         # the kernel is finally handed.
         score_columns = tiles if compete else video_tiles
-        chosen = min(topk + tiles, tiles) if compete else topk
+        chosen = min(topk + geometry.num_prefix_tiles, tiles) if compete else topk
         value_bytes = 1 if self.schedule.quantize_pv else 0
         per_head = (
             geometry.padded_rows * self.head_size * key_bytes  # tiled K
@@ -1210,6 +1217,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
                     key_scale,
                     value_scale,
                     value_mean,
+                    self.softmax_scale,
                 )
                 del dense_index, dense_num
 
@@ -1226,6 +1234,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
                 key_scale,
                 value_scale,
                 value_mean,
+                self.softmax_scale,
             )
             del q2k_index, q2k_num, key_tiled, key_scale
             del value_scale, value_mean, value_operand
