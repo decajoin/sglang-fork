@@ -127,6 +127,81 @@ to flip.
 | `quantize_pv` | false | also run P.V on FP8 tensor cores, V centred per channel first. Has no effect when `quantize` is off |
 | `head_chunk` | 0 | heads per pass; 0 sizes the slice from the budget below. An explicit count overrides it; a count at or above the head count runs them all in one pass. Slicing is exact, not an approximation |
 | `head_chunk_budget_mib` | 512 | transient budget per attention call, which the automatic slice is sized to hit |
+| `kernel` | `auto` | which kernel executes the selection: `triton` (vendored, no dependency), `flashinfer` (FlashInfer's CuTe-DSL SM120 Sage), or `auto` |
+| `sage_head_chunk_budget_mib` | 1536 | the same budget for the `flashinfer` path, which needs its own because its operands cost 4.5x more per head |
+| `sage_min_seq_len` | 32768 | below this many tiled rows, `auto` stays on the Triton kernel |
+
+## Which kernel runs
+
+`kernel` picks the executor, not the function: both compute the same selection
+over the same tiles, and everything above the launch — the tiling, the pooling,
+the top-k, `prefix_mode`, the skip schedule — is shared.
+
+`triton` is the vendored forward in `kernels.py`. It needs no package and no
+arch-specific build, runs on compute capability 8.0 and up at head_dim 64 or
+128, and materialises only K.
+
+`flashinfer` is FlashInfer's CuTe-DSL SM120 Sage kernel. It runs the same
+selection at 515 TFLOPS against the Triton path's 325 — 1.6x on the launch,
+flat across head-slice widths from 3 to 28 — for the same error: 3.82% of the
+output's norm against an fp32 reference over the same block selection, where
+the Triton path measures 3.78%, and neither drifts as K's channel bias grows.
+
+It is not a free swap. The kernel takes contiguous BHSD and returns contiguous
+BHSD, so Q, K, V *and* the output have to be laid out in tile order — 7 bytes
+per padded row-element against the Triton path's 2. That is what the separate
+budget is for, and it is why the win needs a long sequence to pay for itself.
+End to end on the attention op, one RTX 5090, 28 rank-local heads, sparsity
+0.9:
+
+| rows | Triton | Sage | | peak |
+| ---: | ---: | ---: | ---: | --- |
+| 16k | 4.15 ms | 4.43 ms | 0.94x | 0.64 → 0.82 GiB |
+| 42k | 16.0 ms | 13.7 ms | 1.17x | 1.53 → 2.12 GiB |
+| 91k | 57.7 ms | 44.6 ms | 1.29x | 2.96 → 3.55 GiB |
+| 116k | 87.2 ms | 64.7 ms | 1.35x | 3.63 → 4.13 GiB |
+
+`auto` takes it only where every condition holds: an SM120 device, head_dim
+128, `sage_min_seq_len` rows or more, and **both** quantization switches on.
+That last one is not a policy — INT8 Q.K with FP8 P.V is the only arithmetic
+this kernel implements, so a config asking for bf16 P.V is asking for a
+different function, and it gets the kernel that computes it. Since
+`quantize_pv` is off by default, a default deployment stays on the Triton path
+until someone asks for FP8 P.V. Naming `flashinfer` explicitly raises instead
+of falling back, because every reason it cannot apply is one the caller can
+change.
+
+### Installing the kernel
+
+It landed in FlashInfer after 0.6.17 (commit `6a84331e`). `pip install` of the
+repo at that commit will **fail** against `nvidia-cutlass-dsl` 4.6.0 — the
+package's `__init__` reaches into `gdn_kernels`, which needs a newer CuTe-DSL
+than the sparse kernels themselves do. The sparse subpackage depends on
+nothing but `flashinfer.api_logging`, so it can be dropped in beside the
+released one:
+
+```bash
+scripts/install_vsa_h3_sm120_sage.sh        # ~15s, clone included
+```
+
+It resolves the destination by importing `flashinfer`, so run it with the
+interpreter that serves: activate the venv, pass `PYTHON=`, or — for a
+system-wide install — let the default `python3` find it and run under `sudo`,
+which the script's own error message spells out for you when the directory
+turns out to be root-owned. That check runs before the clone, and before the
+replace, so a permission failure costs neither a download nor the install it
+was upgrading. It replaces the directory rather than merging into it, and
+finishes by importing the two entry points `sm120_sage.py` reaches for, which
+is where a CuTe-DSL mismatch would surface. `SRC=` reuses an existing checkout
+instead of cloning.
+
+Nothing in the released package imports that directory — `cute_dsl/__init__.py`
+does not pull in `sparse` either — so the existing install is untouched. It is
+also not in any `dist-info`, so **`pip install -U flashinfer-python` will leave
+it behind stale**: re-run the script after upgrading FlashInfer, or delete
+`cute_dsl/sparse_sm120` if you no longer want the path.
+`sm120_sage.py` tries the released path first, so once FlashInfer ships the
+kernel the side-by-side copy stops being needed.
 
 ## Memory
 

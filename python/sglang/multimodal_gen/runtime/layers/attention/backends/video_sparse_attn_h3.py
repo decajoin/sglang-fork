@@ -114,6 +114,13 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3 import (
     pool_tiles,
     quantize_tiles,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3.sm120_sage import (
+    head_slice_bytes as sm120_sage_head_slice_bytes,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3.sm120_sage import (
+    sm120_sage_attention,
+    sm120_sage_available,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -194,6 +201,29 @@ DEFAULT_HEAD_CHUNK = 0
 # card has room, and remember it bounds the *transients* -- the packed inputs
 # and the output are the caller's and are not counted here.
 DEFAULT_HEAD_CHUNK_BUDGET_MIB = 512
+# The same budget, for the FlashInfer Sage path, which needs its own because
+# its operands cost 9 bytes per padded row-element against the Triton path's 2:
+# it lays out Q, K, V and the output in tile order where that path lays out
+# only K. Holding both to 512 MiB would slice it four times as finely, and the
+# slice count is what the fixed cost per pass multiplies -- measured at 116k
+# rows and 28 rank-local heads, three passes of ten spend 15.6 ms outside the
+# kernel where fourteen passes of two spend 21.3, which is most of what the
+# faster kernel had won. 1536 MiB buys back the three-pass shape at the
+# sequence length this backend is for; it is transients, and it is worth
+# checking against the headroom a full-length request actually leaves.
+DEFAULT_SAGE_HEAD_CHUNK_BUDGET_MIB = 1536
+# Below this many tiled rows the Sage path runs the Triton kernel instead.
+#
+# Its win is in the launches and its cost is in laying the operands out, and
+# the first grows with the square of the sequence while the second grows with
+# the sequence. Measured end to end on one RTX 5090 at 28 rank-local heads and
+# sparsity 0.9, against the Triton path on the same rows: 0.94x at 16k rows,
+# 1.09x at 24k, 1.08x at 34k, 1.18x at 42k, 1.26x at 58k, 1.34x at 91k, 1.33x
+# at 116k. The crossing is between 16k and 24k, but the middle of that range
+# buys single-digit percent for 40-45% more transient memory, which is a bad
+# trade on a card this backend is already sized to fit. 32k is where the
+# speedup is worth the footprint rather than where it first exists.
+DEFAULT_SAGE_MIN_SEQ_LEN = 32768
 # Whether Q.K runs on INT8 tensor cores, SageAttention-style: K is quantized per
 # tile with its per-channel mean removed first (which softmax cancels exactly),
 # Q per tile in registers, and P.V stays bf16. Measured on one RTX 5090 at 36k
@@ -220,6 +250,29 @@ DEFAULT_QUANTIZE = True
 DEFAULT_QUANTIZE_PV = False
 # The largest finite e4m3 value; V's scale is its amax over this.
 FP8_MAX = 448.0
+# Which kernel executes the selection this backend computes.
+#
+# ``triton`` is the vendored forward in ``vsa_h3/kernels.py``: no dependency, no
+# arch-specific build, compute capability 8.0 and up, head_dim 64 or 128, and
+# it gathers Q and V through ``tile_rows`` rather than materialising them.
+#
+# ``flashinfer`` is FlashInfer's CuTe-DSL SM120 Sage kernel, which runs the same
+# selection 1.6x faster (515 TFLOPS against 325, measured at 116k rows and 28
+# rank-local heads, flat across head-slice widths) for the same error against an
+# fp32 reference (3.82% against 3.78%). It needs an SM120 device, head_dim 128,
+# and both quantization switches on, because INT8 Q.K with FP8 P.V is the only
+# arithmetic it implements -- a request for bf16 P.V is a request for a
+# different function, and this backend answers it with the kernel that computes
+# it rather than the one that is fast. It also has to lay Q, K, V and the output
+# out in tile order, which is memory the Triton path does not spend, so the head
+# slice is sized differently for it.
+#
+# ``auto`` takes ``flashinfer`` when every one of those holds and ``triton``
+# otherwise, which is what keeps this a pure speedup rather than a behaviour
+# change: the defaults leave P.V in bf16, so a default deployment stays on the
+# Triton path until someone asks for FP8 P.V.
+DEFAULT_KERNEL = "auto"
+_KERNELS = ("auto", "triton", "flashinfer")
 # Whether prefix keys are exempt from the budget or compete inside it.
 DEFAULT_PREFIX_MODE = "exempt"
 _PREFIX_MODES = ("exempt", "compete")
@@ -680,7 +733,6 @@ def _validate_tile_geometry(
 
 
 class VideoSparseAttentionH3Backend(AttentionBackend):
-
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -740,6 +792,11 @@ class VsaH3Schedule(msgspec.Struct, frozen=True):
     head_chunk_budget_mib: int
     quantize: bool
     quantize_pv: bool
+    # Last, and defaulted, so the many call sites that build a schedule
+    # positionally keep working: these pick the executor, not the function.
+    kernel: str = DEFAULT_KERNEL
+    sage_head_chunk_budget_mib: int = DEFAULT_SAGE_HEAD_CHUNK_BUDGET_MIB
+    sage_min_seq_len: int = DEFAULT_SAGE_MIN_SEQ_LEN
 
     @classmethod
     def from_server_args(cls) -> "VsaH3Schedule":
@@ -776,11 +833,20 @@ class VsaH3Schedule(msgspec.Struct, frozen=True):
             head_chunk_budget_mib=int(
                 config.get("head_chunk_budget_mib", DEFAULT_HEAD_CHUNK_BUDGET_MIB)
             ),
+            sage_head_chunk_budget_mib=int(
+                config.get(
+                    "sage_head_chunk_budget_mib", DEFAULT_SAGE_HEAD_CHUNK_BUDGET_MIB
+                )
+            ),
+            sage_min_seq_len=int(
+                config.get("sage_min_seq_len", DEFAULT_SAGE_MIN_SEQ_LEN)
+            ),
             quantize=quantize,
             # ``quantize`` is the master switch: turning it off has to give the
             # reference kernel, not one quantized GEMM out of two.
             quantize_pv=quantize
             and bool(config.get("quantize_pv", DEFAULT_QUANTIZE_PV)),
+            kernel=str(config.get("kernel", DEFAULT_KERNEL)),
         )
         # sparsity == 0 keeps every tile and is the calibration setting the
         # tests use against dense attention, so it has to stay legal; 1.0 would
@@ -794,6 +860,20 @@ class VsaH3Schedule(msgspec.Struct, frozen=True):
             raise ValueError(
                 f"vsa_h3 prefix_mode must be one of {_PREFIX_MODES}, got "
                 f"{schedule.prefix_mode!r}"
+            )
+        if schedule.kernel not in _KERNELS:
+            raise ValueError(
+                f"vsa_h3 kernel must be one of {_KERNELS}, got {schedule.kernel!r}"
+            )
+        # ``auto`` silently falls back; naming the kernel is a request to be
+        # told when it cannot be honoured, because the reason is always a
+        # config or a host the caller can change.
+        if schedule.kernel == "flashinfer" and not (
+            schedule.quantize and schedule.quantize_pv
+        ):
+            raise ValueError(
+                "vsa_h3 kernel='flashinfer' computes INT8 Q.K with FP8 P.V and has "
+                "no other mode; it needs quantize and quantize_pv both on"
             )
         if (
             schedule.skip_first_steps < 0
@@ -815,6 +895,16 @@ class VsaH3Schedule(msgspec.Struct, frozen=True):
             raise ValueError(
                 "vsa_h3 head_chunk_budget_mib must be at least 1, got "
                 f"{schedule.head_chunk_budget_mib}"
+            )
+        if schedule.sage_head_chunk_budget_mib < 1:
+            raise ValueError(
+                "vsa_h3 sage_head_chunk_budget_mib must be at least 1, got "
+                f"{schedule.sage_head_chunk_budget_mib}"
+            )
+        if schedule.sage_min_seq_len < 0:
+            raise ValueError(
+                "vsa_h3 sage_min_seq_len must be non-negative, got "
+                f"{schedule.sage_min_seq_len}"
             )
         return schedule
 
@@ -1011,6 +1101,34 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
 
     # --------------------------------------------------------------- attention
 
+    def _sage_enabled(self, padded_rows: int) -> bool:
+        """Whether this call runs on FlashInfer's SM120 Sage kernel.
+
+        Resolved per call rather than at construction: the device is only known
+        on the worker, the sequence length is the request's, and
+        ``sm120_sage_available`` caches both the capability probe and the import
+        behind it, so asking is free after the first time.
+        """
+        kernel = self.schedule.kernel
+        if kernel == "triton":
+            return False
+        ready = (
+            self.schedule.quantize
+            and self.schedule.quantize_pv
+            and padded_rows >= self.schedule.sage_min_seq_len
+            and sm120_sage_available(self.head_size)
+        )
+        if kernel == "flashinfer" and not ready:
+            raise RuntimeError(
+                "vsa_h3 kernel='flashinfer' needs an SM120 device with "
+                "FlashInfer's CuTe-DSL SM120 Sage backend, head_dim 128 and at "
+                f"least {self.schedule.sage_min_seq_len} tiled rows; this call "
+                f"has head_dim {self.head_size} and {padded_rows} rows. Use "
+                "kernel='auto' to fall back to the Triton path where it does "
+                "not apply."
+            )
+        return ready
+
     def _head_chunk_for(
         self, geometry: _TileGeometry, heads: int, itemsize: int
     ) -> int:
@@ -1042,15 +1160,27 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         score_columns = tiles if compete else video_tiles
         chosen = min(topk + geometry.num_prefix_tiles, tiles) if compete else topk
         value_bytes = 1 if self.schedule.quantize_pv else 0
-        per_head = (
-            geometry.padded_rows * self.head_size * key_bytes  # tiled K
+        # The Sage kernel materialises Q and the output as well as K and V, so
+        # its operands are asked for their own size rather than described here.
+        sage = self._sage_enabled(geometry.padded_rows)
+        operands = (
+            sm120_sage_head_slice_bytes(geometry.padded_rows, self.head_size)
+            if sage
+            else geometry.padded_rows * self.head_size * key_bytes  # tiled K
             + geometry.padded_rows * self.head_size * value_bytes  # the fp8 V
+        )
+        per_head = (
+            operands
             + 2 * tiles * self.head_size * 4  # the two pooled tile means
             + video_tiles * score_columns * 4  # the score matrix
             + video_tiles * chosen * 16  # top-k's values, indices and copies
             + video_tiles * (chosen + geometry.num_prefix_tiles) * 4  # the list
         )
-        budget = self.schedule.head_chunk_budget_mib * 1024 * 1024
+        budget = (
+            self.schedule.sage_head_chunk_budget_mib
+            if sage
+            else self.schedule.head_chunk_budget_mib
+        ) * (1024 * 1024)
         return _balanced_chunk(heads, max(1, min(heads, budget // max(per_head, 1))))
 
     def _head_slices(self, heads: int, chunk: int) -> Iterator[tuple[int, int]]:
@@ -1143,6 +1273,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         topk = compute_topk(self.schedule.sparsity, geometry.num_video_tiles)
         quantize = self.schedule.quantize
         quantize_pv = self.schedule.quantize_pv
+        sage = self._sage_enabled(geometry.padded_rows)
         out = torch.empty_like(query)
         chunk = self._head_chunk_for(geometry, heads, query.element_size())
 
@@ -1151,8 +1282,9 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
             f"+ {geometry.num_video_tiles} picture), keeping {topk}/"
             f"{geometry.num_video_tiles} picture tiles per picture query tile, "
             f"{'INT8' if quantize else 'bf16'} Q.K and "
-            f"{'FP8' if quantize_pv else 'bf16'} P.V, heads={heads} in slices "
-            f"of {chunk}"
+            f"{'FP8' if quantize_pv else 'bf16'} P.V on the "
+            f"{'FlashInfer SM120 Sage' if sage else 'Triton'} kernel, "
+            f"heads={heads} in slices of {chunk}"
         )
 
         for start, stop in self._head_slices(heads, chunk):
@@ -1161,8 +1293,16 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
             v_slice = value[:, start:stop]
             out_slice = out[:, start:stop]
 
-            key_scale = None
-            if quantize:
+            # The Sage kernel lays out and quantizes its own operands, in its
+            # own layouts -- K per 64-token tile, Q per 32-row group, V
+            # transposed with a per-channel scale -- so none of the buffers
+            # below are built for it.
+            key_tiled = key_scale = None
+            value_scale = value_mean = None
+            value_operand = v_slice
+            if sage:
+                pass
+            elif quantize:
                 # K's per-channel mean over the live rows. Subtracting it before
                 # quantizing shifts every logit in a row by the same -q.km,
                 # which softmax cancels exactly, and it is what keeps the int8
@@ -1177,9 +1317,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
             else:
                 key_tiled = self._tile_key(k_slice, geometry)
 
-            value_scale = value_mean = None
-            value_operand = v_slice
-            if quantize_pv:
+            if quantize_pv and not sage:
                 # V is centred per channel before it is quantized, and the mean
                 # is added back after the softmax normalisation -- exact,
                 # because the weights sum to one, and it is what stops e4m3's
@@ -1224,6 +1362,25 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
                 device=query.device,
                 dtype=torch.int32,
             )
+
+            if sage:
+                # Same selection, same two launches, different executor: the
+                # prefix pass lives inside this call because the operands it
+                # shares with the video pass are laid out there.
+                sm120_sage_attention(
+                    q_slice,
+                    k_slice,
+                    v_slice,
+                    out_slice,
+                    scatter_index=geometry.scatter_index,
+                    variable_block_sizes=sizes,
+                    num_prefix_tiles=prefix_tiles,
+                    q2k_index=q2k_index,
+                    q2k_num=q2k_num,
+                    softmax_scale=self.softmax_scale,
+                )
+                del q2k_index, q2k_num
+                continue
 
             if prefix_tiles:
                 # Prefix queries are dense: every key tile, in order.

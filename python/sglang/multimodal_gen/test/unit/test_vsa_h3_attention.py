@@ -1064,5 +1064,183 @@ class TestVsaH3ReferenceNumerics(unittest.TestCase):
         torch.testing.assert_close(protected, reference, atol=0, rtol=0)
 
 
+class TestVsaH3KernelSelection(unittest.TestCase):
+    """Which executor a config resolves to, and what it refuses."""
+
+    def test_auto_stays_on_triton_without_fp8_pv(self):
+        # The Sage kernel computes INT8 Q.K with FP8 P.V and nothing else, so a
+        # config that asked for bf16 P.V has to keep getting bf16 P.V. This is
+        # what makes the default deployment's behaviour unchanged.
+        impl = _make_impl({"quantize_pv": False, "kernel": "auto"})
+        self.assertFalse(impl._sage_enabled(1 << 20))
+
+    def test_auto_stays_on_triton_without_quantization(self):
+        impl = _make_impl({"quantize": False, "kernel": "auto"})
+        self.assertFalse(impl._sage_enabled(1 << 20))
+
+    def test_triton_is_forced_even_where_sage_would_apply(self):
+        impl = _make_impl({"quantize_pv": True, "kernel": "triton"})
+        self.assertFalse(impl._sage_enabled(1 << 20))
+
+    def test_explicit_flashinfer_rejects_bf16_pv_at_config_time(self):
+        # Naming the kernel is a request to be told, not to be given something
+        # else quietly; and the rejection belongs at startup, not mid-render.
+        with self.assertRaises(ValueError):
+            _make_impl({"quantize_pv": False, "kernel": "flashinfer"})
+
+    def test_unknown_kernel_is_rejected(self):
+        with self.assertRaises(ValueError):
+            _make_impl({"kernel": "cutlass"})
+
+    @requires_gpu
+    def test_auto_takes_sage_where_it_applies(self):
+        from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3.sm120_sage import (  # noqa: E501
+            sm120_sage_available,
+        )
+
+        impl = _make_impl({"quantize_pv": True, "kernel": "auto"})
+        self.assertEqual(impl._sage_enabled(1 << 20), sm120_sage_available(HEAD_DIM))
+
+    @requires_gpu
+    def test_short_sequences_stay_on_triton(self):
+        # Laying the operands out costs O(S) and the launches save O(S^2), so
+        # below the crossing the Sage path is a slower way to get the same
+        # answer for more memory.
+        impl = _make_impl({"quantize_pv": True, "kernel": "auto"})
+        threshold = impl.schedule.sage_min_seq_len
+        self.assertFalse(impl._sage_enabled(threshold - 1))
+
+    @requires_gpu
+    def test_head_dim_64_never_takes_sage(self):
+        from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3.sm120_sage import (  # noqa: E501
+            sm120_sage_available,
+        )
+
+        # The blk64 kernel family is built for one head width and asserts it.
+        self.assertFalse(sm120_sage_available(64))
+
+
+_SAGE_READY = False
+if torch.cuda.is_available():
+    from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3.sm120_sage import (  # noqa: E501
+        sm120_sage_available as _sage_probe,
+    )
+
+    _SAGE_READY = _sage_probe(HEAD_DIM)
+
+requires_sage = unittest.skipUnless(
+    _SAGE_READY, "needs an SM120 GPU with FlashInfer's CuTe-DSL SM120 Sage backend"
+)
+
+
+@requires_sage
+class TestVsaH3SageNumerics(unittest.TestCase):
+    """The Sage kernel computes the same function the Triton one does.
+
+    Both are approximations, so neither is the reference: the comparison is
+    against ``_masked_ref``, which applies the same selection rule in full
+    precision, and the claim is that the two executors land the same distance
+    from it rather than that they agree bit for bit -- they quantize
+    differently (Q per 32-row group and V per channel here, per tile there) and
+    cannot.
+    """
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.device = torch.device("cuda")
+        self.geometry = _geometry()
+        self.q, self.k, self.v = _rows(self.geometry, self.device)
+
+    def _run(self, kernel, **extra):
+        impl = _make_impl(
+            {
+                "sparsity": 0.9,
+                "skip_first_steps": 0,
+                "quantize_pv": True,
+                "kernel": kernel,
+                # The fixture sequence is far below the production crossing;
+                # these tests are about the arithmetic, not the trade.
+                "sage_min_seq_len": 0,
+                **extra,
+            }
+        )
+        with _at_step(30), vsa_h3_sequence_geometry(self.geometry):
+            return impl.forward(
+                self.q.unsqueeze(0), self.k.unsqueeze(0), self.v.unsqueeze(0)
+            )[0]
+
+    def _error(self, out, reference):
+        return ((out.float() - reference).norm() / reference.norm()).item()
+
+    def test_matches_the_triton_path_against_a_full_precision_reference(self):
+        reference = _masked_ref(self.q, self.k, self.v, self.geometry, 0.9).float()
+        triton = self._error(self._run("triton"), reference)
+        sage = self._error(self._run("flashinfer"), reference)
+        self.assertLess(sage, 0.05)
+        # Same selection, same arithmetic in kind: the two must not separate by
+        # more than a quantization scheme's worth of difference.
+        self.assertLess(abs(sage - triton), 0.01)
+
+    def test_ragged_prefix_and_partial_tiles_are_handled(self):
+        # PREFIX is (512, 300, 1000): two of the three segments are not
+        # multiples of 64, so partial tiles reach the kernel through
+        # ``block_sizes``, and the video grid leaves one more.
+        out = self._run("flashinfer")
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertEqual(out.shape, self.q.shape)
+
+    def test_padding_tail_stays_zero_in_varlen(self):
+        # H3 packs one document as (0, used, total); rows past ``used`` are
+        # tail padding whose output has to stay zero.
+        rows = self.geometry.live_rows
+        total = rows + 64
+        q, k, v = (
+            torch.cat(
+                [
+                    t,
+                    torch.randn(
+                        64,
+                        NUM_HEADS,
+                        HEAD_DIM,
+                        device=self.device,
+                        dtype=torch.bfloat16,
+                    ),
+                ]
+            )
+            for t in (self.q, self.k, self.v)
+        )
+        impl = _make_impl(
+            {
+                "sparsity": 0.9,
+                "skip_first_steps": 0,
+                "quantize_pv": True,
+                "kernel": "flashinfer",
+                "sage_min_seq_len": 0,
+            }
+        )
+        cu = torch.tensor([0, rows, total], device=self.device, dtype=torch.int32)
+        with _at_step(30), vsa_h3_sequence_geometry(self.geometry):
+            out = impl.forward_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens=cu,
+                max_seqlen=total,
+                cu_seqlens_host=(0, rows, total),
+            )
+        self.assertEqual(torch.count_nonzero(out[rows:]).item(), 0)
+
+    def test_head_slicing_does_not_change_the_result(self):
+        whole = self._run("flashinfer", head_chunk=NUM_HEADS)
+        sliced = self._run("flashinfer", head_chunk=1)
+        reference = _masked_ref(self.q, self.k, self.v, self.geometry, 0.9).float()
+        # Slicing is exact for attention itself; the selection's pooled scores
+        # are a batched GEMM whose batch is the slice width, so a near-tie in
+        # top-k can flip. Both must stay the same distance from the reference.
+        self.assertLess(
+            abs(self._error(whole, reference) - self._error(sliced, reference)), 0.005
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
