@@ -55,7 +55,10 @@ from sglang.kernels.ops.diffusion.triton.indexed_modulation import (
 from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
     GroupCoordinator,
 )
-from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization import fp8_utils
 
@@ -67,11 +70,17 @@ _MAX_ROW_CHUNKS = 4
 _GEMM_ROW_ALIGNMENT = 4
 
 
-def _flashinfer_block_fp8(linear: nn.Module) -> bool:
-    """Whether this layer quantizes its input the way `quantize_modulated` does."""
-    # A LoRA wrapper is not a ColumnParallelLinear, and it has to see the bf16
-    # input to compute its own delta, so it keeps the all-reduce path.
-    if not isinstance(linear, ColumnParallelLinear):
+def takes_prequantized_input(linear: nn.Module) -> bool:
+    """Whether this layer can be handed its input already FP8-quantized.
+
+    True where the layer's own quantization is sglang's per-token-group
+    quantizer feeding FlashInfer's CUTLASS groupwise GEMM, which the fused
+    kernels reproduce bit for bit, so quantizing ahead of the layer changes
+    nothing but where it happens.
+    """
+    # A LoRA wrapper is neither, and it has to see the bf16 input to compute
+    # its own delta, so it keeps quantizing inside the layer.
+    if not isinstance(linear, (ColumnParallelLinear, RowParallelLinear)):
         return False
     method = linear.quant_method
     return (
@@ -97,7 +106,7 @@ def row_chunks(
     input. Only TP=2 is claimed: beyond two ranks the ring's summation order is
     NCCL's to choose and need not match between the two collectives.
     """
-    if tp_size != 2 or not all(_flashinfer_block_fp8(l) for l in column_linears):
+    if tp_size != 2 or not all(takes_prequantized_input(l) for l in column_linears):
         return 0
     for chunks in range(_MAX_ROW_CHUNKS, 0, -1):
         if rows % (chunks * tp_size * _GEMM_ROW_ALIGNMENT) == 0:

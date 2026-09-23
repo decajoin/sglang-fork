@@ -4,16 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.diffusion.triton.numerics import (
-    div_approx_ftz_f32,
-    round_bf16_to_fp32,
-)
-
-# The constants sglang's per-token-group FP8 quantizer bakes in; the fused
-# kernel below has to agree with it bit for bit, so they are its, not ours.
-_FP8_MAX = tl.constexpr(448.0)
-_FP8_MAX_INV = tl.constexpr(1.0 / 448.0)
-_QUANT_EPS = tl.constexpr(1e-10)
+from sglang.kernels.ops.diffusion.triton.fp8_group_quant import quantize_fp8_groups
+from sglang.kernels.ops.diffusion.triton.numerics import round_bf16_to_fp32
 
 
 @triton.jit
@@ -76,12 +68,7 @@ def _indexed_scale_shift_quant_fp8_kernel(
 
     Both halves reproduce their unfused kernels exactly: the modulation is the
     same Triton arithmetic, rounded to bf16 where that kernel stores it, and the
-    quantization is ``per_token_group_quant.cuh`` as ``--use_fast_math``
-    compiles it -- an exact bf16 absmax, ``amax * (1 / 448)`` as the stored
-    scale, ``div.approx.ftz`` for its inverse, one fp32 multiply, a clamp at
-    +448 and a saturating RNE cast. Flush-to-zero, which that build has and this
-    one does not, only touches products far below e4m3's smallest subnormal,
-    which cast to the same signed zero either way.
+    quantization is ``fp8_group_quant``'s replica of sglang's quantizer.
     """
     row = tl.program_id(0)
     groups = tl.arange(0, BLOCK_GROUPS)
@@ -103,9 +90,7 @@ def _indexed_scale_shift_quant_fp8_kernel(
     scaled = round_bf16_to_fp32(x * one_plus_scale)
     modulated = (scaled + shift).to(tl.bfloat16).to(tl.float32)
 
-    amax = tl.maximum(tl.max(tl.abs(modulated), axis=1), _QUANT_EPS)
-    quant_scale = div_approx_ftz_f32(tl.full(amax.shape, _FP8_MAX, tl.float32), amax)
-    q = tl.minimum(modulated * quant_scale[:, None], _FP8_MAX)
+    q, q_scale = quantize_fp8_groups(modulated)
     tl.store(
         q_ptr + row * stride_q_row + columns,
         q.to(q_ptr.dtype.element_ty),
@@ -113,7 +98,7 @@ def _indexed_scale_shift_quant_fp8_kernel(
     )
     tl.store(
         q_scale_ptr + row * stride_q_scale_row + groups,
-        amax * _FP8_MAX_INV,
+        q_scale,
         mask=groups < num_groups,
     )
 
