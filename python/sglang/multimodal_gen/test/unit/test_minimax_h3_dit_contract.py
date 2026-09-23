@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
+from sglang.multimodal_gen.runtime.layers.lora.linear import wrap_with_lora_layer
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8Config,
     Fp8LinearMethod,
@@ -28,8 +29,10 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MINIMAX_H3_FP32_BUFFER_NAMES,
     MINIMAX_H3_FP32_PARAM_NAMES,
+    MiniMaxH3Attention,
     MiniMaxH3DiTBlock,
     MiniMaxH3DiTModel,
+    MiniMaxH3MLP,
     _attention_row_modality_tags,
     _copy_grouped_qkv_tp_shard,
     _modulate_gate,
@@ -144,7 +147,7 @@ def test_cache_dit_preservation_only_makes_first_gate_out_of_place():
     block.norm1 = torch.nn.Identity()
     block.norm2 = torch.nn.Identity()
     block.attn = _KwargIdentity()
-    block.mlp = torch.nn.Identity()
+    block.mlp = _KwargIdentity()
     gate_modes = []
 
     def fake_gate(residual, _gate, _other, _indices, *, dtype, allow_inplace=True):
@@ -594,3 +597,72 @@ def test_attention_row_tags_are_withheld_when_the_full_sequence_is_missing():
         )
         is None
     )
+
+
+def _small_arch() -> MiniMaxH3DiTArchConfig:
+    arch = MiniMaxH3DiTArchConfig()
+    arch.hidden_size = 128
+    arch.ffn_hidden_size = 256
+    arch.num_attention_heads = 2
+    arch.attention_head_dim = 64
+    return arch
+
+
+def _init_weights(module):
+    # Linear weights start as torch.empty; keep the outputs finite and small.
+    for param in module.parameters():
+        torch.nn.init.normal_(param, std=0.05)
+    return module
+
+
+def _lora(layer, *, rank=4):
+    wrapped = wrap_with_lora_layer(layer, lora_rank=rank, lora_alpha=rank)
+    out_features, in_features = layer.weight.shape
+    wrapped.set_lora_weights(
+        torch.randn(rank, in_features, device="cuda", dtype=torch.bfloat16) * 0.1,
+        torch.randn(out_features, rank, device="cuda", dtype=torch.bfloat16) * 0.1,
+        merge_weights=False,
+    )
+    return wrapped
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("wrapped", [("fc2",), ("fc1", "fc2")])
+def test_mlp_runs_with_its_projections_lora_wrapped(wrapped):
+    # The TP reduction moved out of fc2, so the MLP reduces over a group it
+    # holds itself: a LoRA wrapper around fc2 does not carry `tp_group`.
+    _ensure_single_process_parallel_runtime()
+    torch.manual_seed(0)
+    with torch.device("cuda"):
+        mlp = _init_weights(MiniMaxH3MLP(_small_arch(), None, prefix="mlp").bfloat16())
+    x = torch.randn(8, 128, device="cuda", dtype=torch.bfloat16)
+    without_lora = mlp(x)
+    for name in wrapped:
+        setattr(mlp, name, _lora(getattr(mlp, name)))
+    out = mlp(x)
+    # At TP=1 the reduction is the identity, and the wrapper's delta lands.
+    assert torch.equal(out, mlp.partial(x))
+    assert not torch.equal(out, without_lora)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_attention_runs_with_its_output_projection_lora_wrapped():
+    _ensure_single_process_parallel_runtime()
+    torch.manual_seed(0)
+    with torch.device("cuda"):
+        attn = _init_weights(
+            MiniMaxH3Attention(_small_arch(), None, prefix="attn").bfloat16()
+        )
+    attn.out_proj = _lora(attn.out_proj)
+    local = attn.local_inner_dim
+    # Attention proper is not what is under test; pass Q through.
+    attn.attend = lambda qkv, **_kwargs: qkv[:, :local].contiguous()
+    x = torch.randn(8, 128, device="cuda", dtype=torch.bfloat16)
+    out = attn(
+        x,
+        rope_cache=None,
+        cu_seqlens=torch.tensor([0, 8], dtype=torch.int32, device="cuda"),
+        max_seqlen=8,
+    )
+    expected = attn.out_proj(attn.qkv_proj(x)[0][:, :local].contiguous())[0]
+    assert torch.equal(out, expected)

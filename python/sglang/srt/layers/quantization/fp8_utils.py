@@ -787,30 +787,46 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
-
     input_2d = input.view(-1, input.shape[-1])
     backend = _get_flashinfer_groupwise_backend()
-    # Fall back to triton for non-supported formats.
-    # TODO: Check if flashinfer supports other output dtypes besides bf16.
-    if backend == "trtllm" and (
-        input_2d.shape[1] < 256 or input_2d.dtype != torch.bfloat16
-    ):
-        return triton_w8a8_block_fp8_linear(
-            input, weight, block_size, weight_scale, input_scale, bias
-        )
-
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    # TRTLLM uses the existing SGLang column-major scale layout.
-    # CUTLASS with scale_major_mode="MN" expects (k//block_k, m), so we normalize below.
-    q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=(backend == "trtllm")
-    )
+    if input_scale is not None:
+        # Pre-quantized activation: ``input`` is the fp8 per-token-group q and
+        # ``input_scale`` its row-major (m, k // block_k) scales, exactly what
+        # the quantization below writes for CUTLASS, so a caller that
+        # quantized (and, say, gathered) the rows itself gets the same GEMM.
+        assert backend == "cutlass", (
+            "pre-quantized input is only wired for the FlashInfer CUTLASS "
+            f"backend, got {backend!r}"
+        )
+        assert input.dtype == torch.float8_e4m3fn
+        q_input, x_scale = input_2d, input_scale
+        out_dtype = torch.bfloat16
+    else:
+        assert out is None, "out= is only wired for a pre-quantized input"
+
+        # Fall back to triton for non-supported formats.
+        # TODO: Check if flashinfer supports other output dtypes besides bf16.
+        if backend == "trtllm" and (
+            input_2d.shape[1] < 256 or input_2d.dtype != torch.bfloat16
+        ):
+            return triton_w8a8_block_fp8_linear(
+                input, weight, block_size, weight_scale, input_scale, bias
+            )
+
+        # TRTLLM uses the existing SGLang column-major scale layout.
+        # CUTLASS with scale_major_mode="MN" expects (k//block_k, m), so we
+        # normalize below.
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d, block_size[1], column_major_scales=(backend == "trtllm")
+        )
+        out_dtype = input_2d.dtype
     if backend == "cutlass":
         block_n, block_k = block_size
-        m, k = input_2d.shape
+        m, k = q_input.shape
         n = weight.shape[0]
         expected_x_scale_shape = (k // block_k, m)
         expected_weight_scale_shape = (k // block_k, n // block_n)
@@ -840,19 +856,34 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
             "FlashInfer CUTLASS groupwise FP8 expects weight_scale dtype float32, "
             f"got {weight_scale.dtype}."
         )
-    # TRTLLM path continues using the original quantized scale layout.
-    output = gemm_fp8_nt_groupwise(
-        q_input,
-        weight,
-        x_scale,
-        weight_scale,
-        out_dtype=input_2d.dtype,
-    )
+    if out is not None:
+        # Rows written straight into the caller's buffer. The custom-op
+        # wrapper exists so torch.compile does not trace FlashInfer's JIT, and
+        # it is otherwise this same call with a fresh output.
+        output = _raw_gemm_fp8_nt_groupwise(
+            q_input,
+            weight,
+            x_scale.contiguous(),
+            weight_scale.contiguous(),
+            out=out,
+            out_dtype=out_dtype,
+            backend="cutlass",
+            scale_major_mode="MN",
+        )
+    else:
+        # TRTLLM path continues using the original quantized scale layout.
+        output = gemm_fp8_nt_groupwise(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            out_dtype=out_dtype,
+        )
 
     if bias is not None:
         output += bias
 
-    return output.to(dtype=input_2d.dtype).view(*output_shape)
+    return output.to(dtype=out_dtype).view(*output_shape)
 
 
 def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
