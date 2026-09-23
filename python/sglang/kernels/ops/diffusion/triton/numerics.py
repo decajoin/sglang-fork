@@ -43,6 +43,23 @@ def div_rn_f32(x, y):
 
 
 @triton.jit
+def div_approx_ftz_f32(x, y):
+    """fp32 division as ``nvcc --use_fast_math`` compiles ``x / y``.
+
+    Triton's own ``/`` lowers to ``div.full.f32``, a different approximation,
+    so a kernel that must reproduce a fast-math CUDA kernel spells it out.
+    """
+    return tl.inline_asm_elementwise(
+        asm="div.approx.ftz.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[x, y],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
 def rsqrt_approx_f32(x):
     return tl.inline_asm_elementwise(
         asm="rsqrt.approx.f32 $0, $1;",
@@ -65,6 +82,7 @@ def cuda_rsqrtf(x):
 
 __all__ = [
     "cuda_rsqrtf",
+    "div_approx_ftz_f32",
     "div_rn_f32",
     "mul_rn_f32",
     "round_bf16_to_fp32",

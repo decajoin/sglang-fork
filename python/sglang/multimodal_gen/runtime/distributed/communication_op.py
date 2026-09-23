@@ -30,6 +30,14 @@ def tensor_model_parallel_all_gather(
     return tp_group.all_gather(input_, dim)
 
 
+def tensor_model_parallel_reduce_scatter(
+    input_: torch.Tensor, tp_group: dist.ProcessGroup = None
+) -> torch.Tensor:
+    """Sum across the model parallel group, keeping this rank's rows."""
+    tp_group = tp_group or get_tp_group()
+    return tp_group.reduce_scatter(input_)
+
+
 # TODO: remove model, make it sequence_parallel
 def sequence_model_parallel_all_to_all_4D(
     input_: torch.Tensor, scatter_dim: int = 2, gather_dim: int = 1
