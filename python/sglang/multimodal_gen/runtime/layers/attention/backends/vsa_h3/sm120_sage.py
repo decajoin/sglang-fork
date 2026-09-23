@@ -16,15 +16,15 @@ Blackwell's fp8 path. Added error against an fp32 reference over the same
 block selection is 3.82% where the Triton path is 3.78%, flat as K's channel
 bias grows, because this kernel centres K per tile the same way.
 
-**What it costs.** The Triton kernels gather Q and V through ``tile_rows`` and
-scatter the output back, so only K is ever laid out in tile order. This one
-takes contiguous BHSD and hands back contiguous BHSD, so Q, K, V and the output
-all have to be materialised: 6.6 ms of gather and 2.4 ms of scatter at the
-shape above, against 23.8 ms saved in the launches. The gather is free in the
-sense that matters -- permuting the rows into (4,4,4) cube order costs the same
-as reading them sequentially (46.270 ms against 46.289 for the whole op), which
-is what says the Triton kernel is compute-bound rather than starved -- but the
-*buffers* are not free, and they are what the head slice has to be sized for.
+**What it costs.** This kernel takes contiguous BHSD and hands back contiguous
+BHSD, where the Triton kernels read and write the packed rows in place. The
+operands it needs are quantized straight from the packed rows by
+``sm120_sage_quant``, FlashInfer's own quantizers with their loads pointed
+through ``tile_rows``, and each launch's output is scattered straight back to
+the packed rows, so what gets materialised is INT8 Q and K, FP8 V and one bf16
+result per launch -- not the bf16 tile-ordered Q, K, V and output this path
+first staged, which at 116k rows and 10 heads cost 2.35 ms a head slice to
+write and read back.
 
 **Installation.** The kernel landed in FlashInfer after 0.6.17; the import
 below tries the released path first and the side-by-side directory an
@@ -40,17 +40,24 @@ import functools
 
 import torch
 
+from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3.sm120_sage_quant import (
+    quantize_sage_kv_packed,
+    quantize_sage_q_packed,
+    scatter_tile_rows,
+)
+
 BLOCK_SIZE = 64
 # The blk64 family is built for one head width, and asserts it.
 SUPPORTED_HEAD_DIM = 128
 
 
 @functools.lru_cache(maxsize=1)
-def _load_ops():
-    """``(quantize_q, quantize_kv, attention)``, or ``None`` if unavailable.
+def _load_attention():
+    """FlashInfer's SM120 Sage attention entry point, or ``None``.
 
     Two import roots: the released layout once FlashInfer ships the SM120 Sage
-    backend, and the side-by-side copy described in the module docstring.
+    backend, and the side-by-side copy described in the module docstring. The
+    quantizers are this package's own, so only the attention kernel is needed.
     """
     roots = (
         "flashinfer.cute_dsl.sparse",
@@ -61,18 +68,10 @@ def _load_ops():
             attn = __import__(
                 f"{root}.bsa_attn_sm120", fromlist=["bsa_attn_sm120_blk64_sage_fwd"]
             )
-            quant = __import__(
-                f"{root}.bsa_utils.sage_quant_sm120",
-                fromlist=["quantize_sage_q_sm120", "quantize_sage_kv_sm120"],
-            )
         except (ImportError, OSError, AttributeError):
             continue
         try:
-            return (
-                quant.quantize_sage_q_sm120,
-                quant.quantize_sage_kv_sm120,
-                attn.bsa_attn_sm120_blk64_sage_fwd,
-            )
+            return attn.bsa_attn_sm120_blk64_sage_fwd
         except AttributeError:
             continue
     return None
@@ -89,53 +88,31 @@ def sm120_sage_available(head_dim: int) -> bool:
     Resolved per call rather than once at construction because the head width
     is the caller's and the device is only known on the worker.
     """
-    return head_dim == SUPPORTED_HEAD_DIM and _is_sm120() and _load_ops() is not None
+    return (
+        head_dim == SUPPORTED_HEAD_DIM
+        and _is_sm120()
+        and _load_attention() is not None
+    )
 
 
-# Transient bytes per head, per padded row-element, at the peak of one pass.
-# Measured rather than derived: 6.95 to 6.98, flat from 2 heads to 14, so the
-# constant below is that rounded up. Deriving it from the buffer list
-# over-counts badly, because the staging copies are freed inside the
-# expressions that build them and the quantized operands are freed with the
-# frame that holds them, so they never coexist the way a static reading of the
-# code suggests. Re-measure it if the materialisation changes shape: reading it
-# too high slices the heads more finely than the card needs, and every extra
-# pass pays the fixed cost of a selection and two launches again.
+# Transient bytes per head, per padded row-element, at the peak of one pass,
+# measured (6.95 to 6.98, flat from 2 heads to 14) when this path still staged
+# bf16 Q, K, V and output in tile order. It over-counts now that the operands
+# are quantized straight from the packed rows, and it is kept anyway: the head
+# slice it sizes is also the batch of the pooled-score GEMM, whose last bits
+# decide near-ties in top-k, so a smaller constant would slice differently and
+# change the selection. Lower it together with a render check if the memory is
+# wanted back.
 _SAGE_BYTES_PER_ELEMENT = 7
 
 
 def head_slice_bytes(padded_rows: int, head_dim: int) -> int:
     """Transient bytes per head, to size the head slice against.
 
-    Four and a half times what the Triton path spends (9 bytes a row-element
-    against 2), because that path materialises only K while this one needs Q,
-    K, V and the output laid out in tile order. The score matrix and the index
-    list are the caller's and are counted there, the same way.
+    The score matrix and the index list are the caller's and are counted
+    there, the same way.
     """
     return padded_rows * head_dim * _SAGE_BYTES_PER_ELEMENT
-
-
-def _tile_bhsd(
-    packed: torch.Tensor,
-    slots: torch.Tensor,
-    padded_rows: int,
-) -> torch.Tensor:
-    """Packed ``[S, H, D]`` rows -> contiguous ``[1, H, padded_rows, D]``.
-
-    One pass, not two: scattering into the transposed buffer directly costs
-    1.27 ms where staging a ``[padded, H, D]`` copy and transposing it costs
-    2.33 (116k rows, 28 heads), because the second form writes the whole tensor
-    twice.
-
-    ``slots`` gives each packed row its slot within this buffer. The buffer is
-    zeroed rather than left undefined: the kernel masks pad slots out of the
-    softmax through ``block_sizes``, but the quantizer sees them first, and a
-    garbage row would decide its tile's scale and cost every live row in that
-    tile its precision -- the same reason ``quantize_tiles`` zeroes them.
-    """
-    buffer = packed.new_zeros((1, packed.shape[1], padded_rows, packed.shape[2]))
-    buffer[0].index_copy_(1, slots, packed.transpose(0, 1))
-    return buffer
 
 
 def sm120_sage_attention(
@@ -144,7 +121,7 @@ def sm120_sage_attention(
     value: torch.Tensor,
     out: torch.Tensor,
     *,
-    scatter_index: torch.Tensor,
+    tile_rows: torch.Tensor,
     variable_block_sizes: torch.Tensor,
     num_prefix_tiles: int,
     q2k_index: torch.Tensor,
@@ -154,8 +131,8 @@ def sm120_sage_attention(
     """One head slice of block-sparse attention, on FlashInfer's SM120 Sage path.
 
     ``query``, ``key``, ``value`` and ``out`` are the caller's packed
-    ``[S, H, D]`` rows for this slice. ``scatter_index`` maps each packed row to
-    its tiled slot, ``variable_block_sizes`` gives each tile its live token
+    ``[S, H, D]`` rows for this slice. ``tile_rows`` maps each tiled slot to the
+    packed row it holds, ``variable_block_sizes`` gives each tile its live token
     count, and ``q2k_index`` / ``q2k_num`` are the video launch's selection --
     exactly what ``block_sparse_attn_forward`` takes, so the selection code
     above this is shared between the two paths.
@@ -163,91 +140,26 @@ def sm120_sage_attention(
     Prefix query tiles are dense over every key tile and run as their own launch
     for the same reason the Triton path splits them: a single launch would have
     to size its index list to the widest row, which is the whole sequence, and
-    at 1813 tiles and 28 heads that list alone is 368 MiB.
+    at 1813 tiles and 28 heads that list alone is 368 MiB. Each launch
+    quantizes only its own query slots and writes only its own tiles' rows.
     """
-    tiled_out = _attend_in_tile_order(
-        query=query,
-        key=key,
-        value=value,
-        scatter_index=scatter_index,
-        variable_block_sizes=variable_block_sizes,
-        num_prefix_tiles=num_prefix_tiles,
-        q2k_index=q2k_index,
-        q2k_num=q2k_num,
-        softmax_scale=softmax_scale,
-    )
-    # ``scatter_index`` is packed row -> tiled slot, so indexing the tiled
-    # output with it is the inverse permutation. Pad slots are never read, which
-    # is why that buffer could be left uninitialised. Everything the launches
-    # held is already freed here, which is what keeps the gather off the peak.
-    out.copy_(tiled_out[scatter_index])
-    return out
-
-
-def _attend_in_tile_order(
-    *,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    scatter_index: torch.Tensor,
-    variable_block_sizes: torch.Tensor,
-    num_prefix_tiles: int,
-    q2k_index: torch.Tensor,
-    q2k_num: torch.Tensor,
-    softmax_scale: float,
-) -> torch.Tensor:
-    """The two launches, returning ``[padded_rows, H, D]`` in tile order.
-
-    Split from the entry point so the quantized operands are locals of a frame
-    that returns before the output is gathered back into packed order: they are
-    the largest transients in the call, and holding them across that gather
-    would raise the peak the head slice is sized against.
-    """
-    quantize_q, quantize_kv, attention = _load_ops()
+    attention = _load_attention()
     tiles = int(variable_block_sizes.numel())
-    padded_rows = tiles * BLOCK_SIZE
-    heads, dim = query.shape[1], query.shape[2]
-
-    k_int8, v_fp8, k_scale, v_scale = quantize_kv(
-        _tile_bhsd(key, scatter_index, padded_rows),
-        _tile_bhsd(value, scatter_index, padded_rows),
+    heads = query.shape[1]
+    k_int8, v_fp8, k_scale, v_scale = quantize_sage_kv_packed(
+        key, value, tile_rows=tile_rows, block_sizes=variable_block_sizes
     )
-
-    # Each launch lays out only its own query rows, so neither pays for the
-    # other's. That needs the prefix's packed rows to be a front block, which
-    # they are for every geometry this backend builds -- prefix segments fill
-    # the low tiles and the tiling preserves that order. It is checked rather
-    # than assumed: the fallback costs one copy of Q, and a wrong split would
-    # cost correctness.
-    live_rows = int(scatter_index.numel())
-    boundary = num_prefix_tiles * BLOCK_SIZE
-    prefix_rows = int((scatter_index < boundary).sum()) if num_prefix_tiles else 0
-    query_tiled = None
-    if num_prefix_tiles and not bool((scatter_index[:prefix_rows] < boundary).all()):
-        query_tiled = _tile_bhsd(query, scatter_index, padded_rows)
-
-    tiled_out = query.new_empty((padded_rows, heads, dim))
 
     def launch(
-        first_tile: int,
-        tile_count: int,
-        index: torch.Tensor,
-        counts: torch.Tensor,
-        row_lo: int,
-        row_hi: int,
+        first_tile: int, tile_count: int, index: torch.Tensor, counts: torch.Tensor
     ) -> None:
-        first_row = first_tile * BLOCK_SIZE
-        rows = tile_count * BLOCK_SIZE
-        if query_tiled is not None:
-            q_bhsd = query_tiled[:, :, first_row : first_row + rows].contiguous()
-        else:
-            q_bhsd = _tile_bhsd(
-                query[row_lo:row_hi],
-                scatter_index[row_lo:row_hi] - first_row,
-                rows,
-            )
-        q_int8, q_scale = quantize_q(q_bhsd)
-        del q_bhsd
+        q_int8, q_scale = quantize_sage_q_packed(
+            query,
+            tile_rows=tile_rows,
+            block_sizes=variable_block_sizes,
+            first_row=first_tile * BLOCK_SIZE,
+            rows=tile_count * BLOCK_SIZE,
+        )
         result = attention(
             q_int8,
             k_int8,
@@ -262,7 +174,13 @@ def _attend_in_tile_order(
             softmax_scale=float(softmax_scale),
             backend="cute_dsl",
         )
-        tiled_out[first_row : first_row + rows] = result[0].transpose(0, 1)
+        scatter_tile_rows(
+            result,
+            out,
+            tile_rows=tile_rows,
+            block_sizes=variable_block_sizes,
+            first_tile=first_tile,
+        )
 
     if num_prefix_tiles:
         dense_index = torch.arange(
@@ -271,18 +189,11 @@ def _attend_in_tile_order(
         dense_num = torch.full(
             (heads, num_prefix_tiles), tiles, device=query.device, dtype=torch.int32
         )
-        launch(0, num_prefix_tiles, dense_index, dense_num, 0, prefix_rows)
+        launch(0, num_prefix_tiles, dense_index, dense_num)
         del dense_index, dense_num
 
-    launch(
-        num_prefix_tiles,
-        tiles - num_prefix_tiles,
-        q2k_index,
-        q2k_num,
-        prefix_rows,
-        live_rows,
-    )
-    return tiled_out
+    launch(num_prefix_tiles, tiles - num_prefix_tiles, q2k_index, q2k_num)
+    return out
 
 
 __all__ = [

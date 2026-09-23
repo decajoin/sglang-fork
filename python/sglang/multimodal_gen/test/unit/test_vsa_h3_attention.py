@@ -1189,6 +1189,18 @@ class TestVsaH3SageNumerics(unittest.TestCase):
         self.assertTrue(torch.isfinite(out).all())
         self.assertEqual(out.shape, self.q.shape)
 
+    def test_protected_rows_that_do_not_lead_the_packed_rows(self):
+        # Reference pictures ahead of protected text leave the prefix tiles'
+        # rows scattered through the packed sequence, so both launches reach
+        # them only through ``tile_rows``; it has to land where Triton does.
+        self.geometry = _ref_geometry()
+        self.q, self.k, self.v = _rows(self.geometry, self.device)
+        reference = _masked_ref(self.q, self.k, self.v, self.geometry, 0.9).float()
+        triton = self._error(self._run("triton"), reference)
+        sage = self._error(self._run("flashinfer"), reference)
+        self.assertLess(sage, 0.05)
+        self.assertLess(abs(sage - triton), 0.01)
+
     def test_padding_tail_stays_zero_in_varlen(self):
         # H3 packs one document as (0, used, total); rows past ``used`` are
         # tail padding whose output has to stay zero.
@@ -1239,6 +1251,96 @@ class TestVsaH3SageNumerics(unittest.TestCase):
         # top-k can flip. Both must stay the same distance from the reference.
         self.assertLess(
             abs(self._error(whole, reference) - self._error(sliced, reference)), 0.005
+        )
+
+
+def _flashinfer_sage_quant():
+    """FlashInfer's own Sage quantizers, from whichever root the kernel is under."""
+    for root in ("flashinfer.cute_dsl.sparse", "flashinfer.cute_dsl.sparse_sm120"):
+        try:
+            return __import__(
+                f"{root}.bsa_utils.sage_quant_sm120",
+                fromlist=["quantize_sage_q_sm120", "quantize_sage_kv_sm120"],
+            )
+        except ImportError:
+            continue
+    raise unittest.SkipTest("FlashInfer's Sage quantizers are not importable")
+
+
+@requires_sage
+class TestVsaH3SagePackedQuant(unittest.TestCase):
+    """Quantizing from the packed rows gives FlashInfer's operands, bit for bit.
+
+    The reference is FlashInfer's quantizer fed the zero-padded tile-ordered
+    buffer the Sage path used to stage; the packed quantizers read the same
+    rows through ``tile_rows`` and must write identical bytes, on a geometry
+    whose prefix rows lead the packed sequence and on one whose do not.
+    """
+
+    def _check(self, tiles):
+        from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3.sm120_sage_quant import (  # noqa: E501
+            quantize_sage_kv_packed,
+            quantize_sage_q_packed,
+            scatter_tile_rows,
+        )
+
+        flashinfer = _flashinfer_sage_quant()
+        torch.manual_seed(0)
+        device = torch.device("cuda")
+        live = tiles.scatter_index.numel()
+        # A head slice of a wider tensor, strided the way the backend's are,
+        # with a channel bias for K's centring to act on.
+        bias = torch.randn(NUM_HEADS + 2, HEAD_DIM, device=device) * 2
+        q, k, v = (
+            (torch.randn(live, NUM_HEADS + 2, HEAD_DIM, device=device) + bias)
+            .bfloat16()[:, 1 : NUM_HEADS + 1]
+            for _ in range(3)
+        )
+
+        def staged(x):
+            buffer = x.new_zeros((1, NUM_HEADS, tiles.padded_rows, HEAD_DIM))
+            buffer[0].index_copy_(1, tiles.scatter_index, x.transpose(0, 1))
+            return buffer
+
+        def same(a, b):
+            return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+        packed = dict(tile_rows=tiles.tile_rows, block_sizes=tiles.variable_block_sizes)
+        expected = flashinfer.quantize_sage_kv_sm120(staged(k), staged(v))
+        for want, got in zip(expected, quantize_sage_kv_packed(k, v, **packed)):
+            self.assertTrue(same(want, got))
+
+        q_staged = staged(q)
+        prefix = tiles.num_prefix_tiles
+        launches = ((0, prefix), (prefix, tiles.num_tiles - prefix))
+        results = []
+        for first, count in launches:
+            rows = slice(first * BLOCK, (first + count) * BLOCK)
+            want = flashinfer.quantize_sage_q_sm120(q_staged[:, :, rows].contiguous())
+            got = quantize_sage_q_packed(
+                q, first_row=first * BLOCK, rows=count * BLOCK, **packed
+            )
+            self.assertTrue(same(want[0], got[0]) and same(want[1], got[1]))
+            results.append(
+                torch.randn(
+                    1, NUM_HEADS, count * BLOCK, HEAD_DIM, device=device
+                ).bfloat16()
+            )
+
+        # Writing each launch's result back: the tile-ordered buffer gathered
+        # through ``scatter_index`` is what the Sage path used to return.
+        tiled = torch.cat([r[0] for r in results], dim=1).transpose(0, 1)
+        out = torch.empty_like(q)
+        for (first, _), result in zip(launches, results):
+            scatter_tile_rows(result, out, first_tile=first, **packed)
+        self.assertTrue(same(out, tiled[tiles.scatter_index]))
+
+    def test_prefix_rows_leading_the_packed_sequence(self):
+        self._check(_tile_geometry(PREFIX, VIDEO_GRID, torch.device("cuda")))
+
+    def test_prefix_rows_scattered_through_the_packed_sequence(self):
+        self._check(
+            _tile_geometry(REF_PREFIX, VIDEO_GRID, torch.device("cuda"), REF_VISUALS)
         )
 
 

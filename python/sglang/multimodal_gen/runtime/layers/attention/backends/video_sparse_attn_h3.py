@@ -1372,7 +1372,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
                     k_slice,
                     v_slice,
                     out_slice,
-                    scatter_index=geometry.scatter_index,
+                    tile_rows=tile_rows,
                     variable_block_sizes=sizes,
                     num_prefix_tiles=prefix_tiles,
                     q2k_index=q2k_index,
