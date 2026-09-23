@@ -54,6 +54,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+    vsa_h3_rows_ready,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -1510,21 +1513,43 @@ class MiniMaxH3DiTBlock(nn.Module):
         qkv = x.new_empty((whole * chunks, qkv_proj.output_size_per_partition))
         for span, pending in zip(rows, gathered):
             linear_into(qkv_proj, pending.result(), qkv[span])
-        attended = self.attn.attend(
-            qkv,
-            rope_cache=rope_cache,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_host=cu_seqlens_host,
-            max_seqlen=max_seqlen,
-        )
-        del qkv
 
-        # Output projection, reduce-scattered a chunk at a time.
+        # Output projection, reduce-scattered a chunk at a time, each chunk as
+        # soon as attention has finished its rows where the backend can say
+        # so: the reduce-scatters then run under the rest of the attention
+        # instead of after it. Whatever it does not hand out early is
+        # projected from the output it returns.
         out_proj = self.attn.out_proj
-        reduced = [
-            lane.reduce_scatter(out_proj(attended[span])[0], group=self.attn.tp_group)
-            for span in rows
-        ]
+        reduced = []
+
+        def project(index: int, attended) -> None:
+            span = rows[index]
+            if isinstance(attended, tuple):
+                # Already the projection's quantized input.
+                rows_in = (attended[0][span], attended[1][span])
+            else:
+                rows_in = attended[span].reshape(span.stop - span.start, -1)
+            partial, _ = out_proj(rows_in)
+            reduced.append(lane.reduce_scatter(partial, group=self.attn.tp_group))
+
+        # Where the projection quantizes a head per group, the attention can
+        # hand its rows over quantized and skip writing them as bf16.
+        fp8 = (
+            takes_prequantized_input(out_proj)
+            and out_proj.quant_method.quant_config.weight_block_size[1]
+            == self.attn.head_dim
+        )
+        with vsa_h3_rows_ready(tuple(span.stop for span in rows), project, fp8=fp8):
+            attended = self.attn.attend(
+                qkv,
+                rope_cache=rope_cache,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_host=cu_seqlens_host,
+                max_seqlen=max_seqlen,
+            )
+        del qkv
+        for index in range(len(reduced), chunks):
+            project(index, attended)
         del attended
 
         # Gated residual, then the MLP's input, quantized and gathered.

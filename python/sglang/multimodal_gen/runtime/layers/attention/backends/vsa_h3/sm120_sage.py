@@ -37,6 +37,7 @@ FlashInfer.
 from __future__ import annotations
 
 import functools
+from typing import Callable
 
 import torch
 
@@ -44,6 +45,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3.sm120_sage_q
     quantize_sage_kv_packed,
     quantize_sage_q_packed,
     scatter_tile_rows,
+    scatter_tile_rows_fp8,
 )
 
 BLOCK_SIZE = 64
@@ -89,9 +91,7 @@ def sm120_sage_available(head_dim: int) -> bool:
     is the caller's and the device is only known on the worker.
     """
     return (
-        head_dim == SUPPORTED_HEAD_DIM
-        and _is_sm120()
-        and _load_attention() is not None
+        head_dim == SUPPORTED_HEAD_DIM and _is_sm120() and _load_attention() is not None
     )
 
 
@@ -119,7 +119,7 @@ def sm120_sage_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    out: torch.Tensor,
+    out: torch.Tensor | None,
     *,
     tile_rows: torch.Tensor,
     variable_block_sizes: torch.Tensor,
@@ -127,7 +127,10 @@ def sm120_sage_attention(
     q2k_index: torch.Tensor,
     q2k_num: torch.Tensor,
     softmax_scale: float,
-) -> torch.Tensor:
+    video_segments: tuple[int, ...] = (),
+    on_segment: Callable[[int], None] | None = None,
+    fp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> None:
     """One head slice of block-sparse attention, on FlashInfer's SM120 Sage path.
 
     ``query``, ``key``, ``value`` and ``out`` are the caller's packed
@@ -142,6 +145,16 @@ def sm120_sage_attention(
     to size its index list to the widest row, which is the whole sequence, and
     at 1813 tiles and 28 heads that list alone is 368 MiB. Each launch
     quantizes only its own query slots and writes only its own tiles' rows.
+
+    ``video_segments`` cuts the video launch further, at increasing tile ends
+    the last of which is every tile, and ``on_segment(i)`` is told once the
+    tiles before the ``i``-th end have run. The kernel computes each query
+    tile on its own, so the cut changes which launch writes a row, not what
+    it writes.
+
+    With ``fp8_out`` -- packed ``[S, H, D]`` e4m3 and ``[S, H]`` fp32 scales
+    -- the rows are written as the per-(row, head) FP8 groups the output
+    projection would quantize them into, and ``out`` is not written at all.
     """
     attention = _load_attention()
     tiles = int(variable_block_sizes.numel())
@@ -174,6 +187,15 @@ def sm120_sage_attention(
             softmax_scale=float(softmax_scale),
             backend="cute_dsl",
         )
+        if fp8_out is not None:
+            scatter_tile_rows_fp8(
+                result,
+                *fp8_out,
+                tile_rows=tile_rows,
+                block_sizes=variable_block_sizes,
+                first_tile=first_tile,
+            )
+            return
         scatter_tile_rows(
             result,
             out,
@@ -192,8 +214,14 @@ def sm120_sage_attention(
         launch(0, num_prefix_tiles, dense_index, dense_num)
         del dense_index, dense_num
 
-    launch(num_prefix_tiles, tiles - num_prefix_tiles, q2k_index, q2k_num)
-    return out
+    first = num_prefix_tiles
+    for index, end in enumerate(video_segments or (tiles,)):
+        if end > first:
+            picked = slice(first - num_prefix_tiles, end - num_prefix_tiles)
+            launch(first, end - first, q2k_index[:, picked], q2k_num[:, picked])
+            first = end
+        if on_segment is not None:
+            on_segment(index)
 
 
 __all__ = [

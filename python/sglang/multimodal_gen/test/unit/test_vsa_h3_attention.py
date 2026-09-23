@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h
     _split_text_visuals,
     _tile_geometry,
     compute_topk,
+    vsa_h3_rows_ready,
     vsa_h3_sequence_geometry,
 )
 
@@ -1292,8 +1293,9 @@ class TestVsaH3SagePackedQuant(unittest.TestCase):
         # with a channel bias for K's centring to act on.
         bias = torch.randn(NUM_HEADS + 2, HEAD_DIM, device=device) * 2
         q, k, v = (
-            (torch.randn(live, NUM_HEADS + 2, HEAD_DIM, device=device) + bias)
-            .bfloat16()[:, 1 : NUM_HEADS + 1]
+            (
+                torch.randn(live, NUM_HEADS + 2, HEAD_DIM, device=device) + bias
+            ).bfloat16()[:, 1 : NUM_HEADS + 1]
             for _ in range(3)
         )
 
@@ -1346,3 +1348,133 @@ class TestVsaH3SagePackedQuant(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@requires_gpu
+class TestVsaH3EarlyRows(unittest.TestCase):
+    """Rows handed out early are the rows the call returns, bit for bit.
+
+    Cutting the video launch at the caller's row bounds must change when rows
+    are written and nothing else, on either executor, with the head slices
+    and the padding tail a real call has. Each callback snapshots the rows it
+    was told about on the stream it was told on, so a snapshot that differs
+    from the final output is a row handed out before it was final.
+    """
+
+    PAD = 64 * 3
+
+    def _run(self, kernel, geometry, *, head_chunk=0, bounds=None, fp8=False):
+        torch.manual_seed(0)
+        device = torch.device("cuda")
+        rows = geometry.live_rows
+        total = rows + self.PAD
+        q, k, v = (
+            torch.randn(total, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
+            for _ in range(3)
+        )
+        impl = _make_impl(
+            {
+                "sparsity": 0.9,
+                "skip_first_steps": 0,
+                "quantize_pv": True,
+                "kernel": kernel,
+                "sage_min_seq_len": 0,
+                "head_chunk": head_chunk,
+            }
+        )
+        seen = []
+
+        def ready(index, rows):
+            end = bounds[index]
+            if isinstance(rows, tuple):
+                seen.append((index, tuple(t[:end].clone() for t in rows)))
+            else:
+                seen.append((index, rows[:end].clone()))
+
+        cu = torch.tensor([0, rows, total], device=device, dtype=torch.int32)
+        with _at_step(30), vsa_h3_sequence_geometry(geometry):
+            call = lambda: impl.forward_varlen(  # noqa: E731
+                q,
+                k,
+                v,
+                cu_seqlens=cu,
+                max_seqlen=total,
+                cu_seqlens_host=(0, rows, total),
+            )
+            if bounds is None:
+                return call(), seen
+            with vsa_h3_rows_ready(bounds, ready, fp8=fp8):
+                return call(), seen
+
+    def _check(self, kernel, geometry, **kwargs):
+        total = geometry.live_rows + self.PAD
+        # Uneven bounds, one inside the prefix and one inside the padding.
+        bounds = (200, total // 3, total // 2 + 17, geometry.live_rows + 5, total)
+        whole, _ = self._run(kernel, geometry, **kwargs)
+        early, seen = self._run(kernel, geometry, bounds=bounds, **kwargs)
+        self.assertTrue(torch.equal(early, whole))
+        self.assertEqual([index for index, _ in seen], list(range(len(bounds))))
+        for index, rows in seen:
+            self.assertTrue(torch.equal(rows, whole[: bounds[index]]), index)
+
+    def test_triton(self):
+        self._check("triton", _geometry())
+
+    def test_triton_with_references_and_head_slices(self):
+        self._check("triton", _ref_geometry(), head_chunk=1)
+
+    @requires_sage
+    def test_sage(self):
+        self._check("flashinfer", _geometry())
+
+    @requires_sage
+    def test_sage_with_references_and_head_slices(self):
+        self._check("flashinfer", _ref_geometry(), head_chunk=3)
+
+    def test_bounds_that_do_not_cover_the_call_are_ignored(self):
+        geometry = _geometry()
+        whole, _ = self._run("triton", geometry)
+        early, seen = self._run("triton", geometry, bounds=(100, 200))
+        self.assertTrue(torch.equal(early, whole))
+        self.assertEqual(seen, [])
+
+    def _bounds(self, geometry):
+        total = geometry.live_rows + self.PAD
+        return (200, total // 3, total // 2 + 17, geometry.live_rows + 5, total)
+
+    @requires_sage
+    def test_sage_hands_out_fp8_rows_that_quantize_the_bf16_ones(self):
+        # With one head per group, the FP8 rows are what the output projection
+        # would have made of the bf16 ones, padding tail included.
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        geometry = _ref_geometry()
+        bounds = self._bounds(geometry)
+        whole, _ = self._run("flashinfer", geometry, head_chunk=3)
+        _, seen = self._run(
+            "flashinfer", geometry, head_chunk=3, bounds=bounds, fp8=True
+        )
+        expected_q, expected_scale = sglang_per_token_group_quant_fp8(
+            whole.reshape(whole.shape[0], -1), HEAD_DIM
+        )
+        self.assertEqual([index for index, _ in seen], list(range(len(bounds))))
+        for index, (q, scale) in seen:
+            end = bounds[index]
+            self.assertTrue(
+                torch.equal(q.view(torch.uint8), expected_q[:end].view(torch.uint8))
+            )
+            self.assertTrue(
+                torch.equal(
+                    scale.view(torch.int32), expected_scale[:end].view(torch.int32)
+                )
+            )
+
+    def test_triton_hands_out_bf16_even_when_fp8_is_asked(self):
+        geometry = _geometry()
+        bounds = self._bounds(geometry)
+        whole, _ = self._run("triton", geometry)
+        early, seen = self._run("triton", geometry, bounds=bounds, fp8=True)
+        self.assertTrue(torch.equal(early, whole))
+        self.assertTrue(all(isinstance(rows, torch.Tensor) for _, rows in seen))

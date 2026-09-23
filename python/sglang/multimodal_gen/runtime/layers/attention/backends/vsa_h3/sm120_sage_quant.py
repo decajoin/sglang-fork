@@ -27,6 +27,8 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.kernels.ops.diffusion.triton.fp8_group_quant import quantize_fp8_groups
+
 BLOCK_SIZE = 64
 SAGE_Q_GROUP_SIZE = 32
 SAGE_Q_BLOCK_SIZE = 128
@@ -72,10 +74,7 @@ def _quantize_sage_q_packed_kernel(
         tile_rows_ptr, block_sizes_ptr, first_slot + row_idx, valid
     )
     q = tl.load(
-        q_ptr
-        + head_idx * q_stride_h
-        + packed[:, None] * q_stride_s
-        + dim_idx[None, :],
+        q_ptr + head_idx * q_stride_h + packed[:, None] * q_stride_s + dim_idx[None, :],
         mask=live[:, None],
         other=0.0,
     ).to(tl.float32)
@@ -88,7 +87,10 @@ def _quantize_sage_q_packed_kernel(
         -127.0,
     )
     tl.store(
-        q8_ptr + head_idx * q8_stride_h + row_idx[:, None] * q8_stride_s + dim_idx[None, :],
+        q8_ptr
+        + head_idx * q8_stride_h
+        + row_idx[:, None] * q8_stride_s
+        + dim_idx[None, :],
         q_quant.to(tl.int8),
         mask=valid[:, None],
     )
@@ -168,8 +170,12 @@ def _sage_kv_stats_finalize_kernel(
             + chunk_idx[:, None] * partial_stride_c
             + dim_idx[None, :]
         )
-        partial_sum = tl.load(k_partial_ptr + partial_offset, mask=mask[:, None], other=0.0)
-        partial_max = tl.load(v_partial_ptr + partial_offset, mask=mask[:, None], other=0.0)
+        partial_sum = tl.load(
+            k_partial_ptr + partial_offset, mask=mask[:, None], other=0.0
+        )
+        partial_max = tl.load(
+            v_partial_ptr + partial_offset, mask=mask[:, None], other=0.0
+        )
         sum_acc += tl.sum(partial_sum, axis=0)
         max_acc = tl.maximum(max_acc, tl.max(partial_max, axis=0))
         chunk_base += REDUCE_TILE
@@ -240,7 +246,10 @@ def _quantize_sage_kv_packed_kernel(
         -127.0,
     )
     tl.store(
-        k8_ptr + head_idx * k8_stride_h + row_idx[:, None] * k8_stride_s + dim_idx[None, :],
+        k8_ptr
+        + head_idx * k8_stride_h
+        + row_idx[:, None] * k8_stride_s
+        + dim_idx[None, :],
         k_quant.to(tl.int8),
         mask=valid[:, None],
     )
@@ -293,9 +302,61 @@ def _scatter_tile_rows_kernel(
         + dim_idx[None, :]
     )
     tl.store(
-        out_ptr + packed[:, None] * out_stride_s + head_idx * out_stride_h + dim_idx[None, :],
+        out_ptr
+        + packed[:, None] * out_stride_s
+        + head_idx * out_stride_h
+        + dim_idx[None, :],
         values,
         mask=live[:, None],
+    )
+
+
+@triton.jit
+def _scatter_tile_rows_fp8_kernel(
+    result_ptr,
+    tile_rows_ptr,
+    block_sizes_ptr,
+    q_ptr,
+    scale_ptr,
+    result_stride_h,
+    result_stride_s,
+    q_stride_s,
+    q_stride_h,
+    scale_stride_s,
+    scale_stride_h,
+    first_tile,
+    HEAD_DIM: tl.constexpr,
+):
+    """``_scatter_tile_rows_kernel``, quantized on the way out.
+
+    A (row, head) is one group of the output projection's per-token-group FP8
+    quantization when the group is a head wide, so each row this program
+    scatters is quantized whole, the way ``fp8_group_quant`` reproduces
+    sglang's quantizer, from the same bf16 values the plain scatter stores.
+    """
+    tile = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    local = tl.arange(0, 64)
+    dim_idx = tl.arange(0, HEAD_DIM)
+    slot = (first_tile + tile) * 64 + local
+    live = local < tl.load(block_sizes_ptr + first_tile + tile)
+    packed = tl.load(tile_rows_ptr + slot).to(tl.int64)
+    values = tl.load(
+        result_ptr
+        + head_idx * result_stride_h
+        + (tile * 64 + local)[:, None] * result_stride_s
+        + dim_idx[None, :]
+    ).to(tl.float32)
+    q, q_scale = quantize_fp8_groups(values)
+    tl.store(
+        q_ptr + packed[:, None] * q_stride_s + head_idx * q_stride_h + dim_idx[None, :],
+        q.to(q_ptr.dtype.element_ty),
+        mask=live[:, None],
+    )
+    tl.store(
+        scale_ptr + packed * scale_stride_s + head_idx * scale_stride_h,
+        q_scale,
+        mask=live,
     )
 
 
@@ -448,8 +509,43 @@ def scatter_tile_rows(
     )
 
 
+def scatter_tile_rows_fp8(
+    result: torch.Tensor,
+    q_out: torch.Tensor,
+    scale_out: torch.Tensor,
+    *,
+    tile_rows: torch.Tensor,
+    block_sizes: torch.Tensor,
+    first_tile: int,
+) -> None:
+    """``scatter_tile_rows`` into per-(row, head) FP8 groups instead of bf16.
+
+    ``q_out`` is packed ``[S, H, D]`` e4m3 and ``scale_out`` ``[S, H]`` fp32:
+    what ``sglang_per_token_group_quant_fp8`` gives for the bf16 rows with a
+    group of ``D``, bit for bit.
+    """
+    heads, rows, head_dim = result.shape[1], result.shape[2], result.shape[3]
+    _scatter_tile_rows_fp8_kernel[(rows // BLOCK_SIZE, heads)](
+        result,
+        tile_rows,
+        block_sizes,
+        q_out,
+        scale_out,
+        result.stride(1),
+        result.stride(2),
+        q_out.stride(0),
+        q_out.stride(1),
+        scale_out.stride(0),
+        scale_out.stride(1),
+        first_tile,
+        HEAD_DIM=head_dim,
+        num_warps=4,
+    )
+
+
 __all__ = [
     "quantize_sage_kv_packed",
     "quantize_sage_q_packed",
     "scatter_tile_rows",
+    "scatter_tile_rows_fp8",
 ]

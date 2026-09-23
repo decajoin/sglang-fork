@@ -88,8 +88,8 @@ import math
 import re
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
-from typing import Any, Iterator
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterator
 
 import msgspec
 import torch
@@ -121,6 +121,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3.sm120_sage i
     sm120_sage_attention,
     sm120_sage_available,
 )
+from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -400,6 +401,48 @@ def vsa_h3_sequence_geometry(
         _sequence_geometry.reset(token)
 
 
+# The rows a call hands out early: its bf16 output, or the FP8 pair for it.
+AttentionRows = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+RowsReady = Callable[[int, AttentionRows], None]
+
+_rows_ready: ContextVar[tuple[tuple[int, ...], RowsReady, bool] | None] = ContextVar(
+    "vsa_h3_rows_ready", default=None
+)
+
+
+@contextmanager
+def vsa_h3_rows_ready(
+    bounds: tuple[int, ...], ready: RowsReady, *, fp8: bool = False
+) -> Iterator[None]:
+    """Hand the caller leading rows of the next attention output early.
+
+    ``bounds`` are increasing row ends over the rows the call receives, the
+    last one all of them. ``ready(i, rows)`` is called, in order, once rows
+    ``[0, bounds[i])`` of ``rows`` -- the tensor the call will return -- are
+    final on the current stream, so work the caller queues there in the
+    callback runs after them while the rest of the attention is still queued.
+
+    It is a hint, not a contract to call back: a call that runs dense, or
+    cannot split along these rows, calls back for none of them, or for fewer
+    than all, and the caller finishes the rest from the tensor it is handed.
+    Only the next call's output is offered; the callback owns the rows it was
+    told about only for reading.
+
+    ``fp8`` asks for the rows as the FP8 input of a projection that quantizes
+    per token in groups of one head: ``rows`` is then ``(fp8 [T, H * D],
+    fp32 scales [T, H])``, bit for bit what quantizing the bf16 rows gives. A
+    call that can oblige -- the Sage kernel's -- hands out every bound that
+    way and writes no bf16 rows, so the tensor it returns is a placeholder of
+    the right shape that holds nothing; one that cannot hands out bf16 rows,
+    or none.
+    """
+    token = _rows_ready.set((bounds, ready, fp8))
+    try:
+        yield
+    finally:
+        _rows_ready.reset(token)
+
+
 # ``blocks.<idx>.attn`` is a DiT layer; ``token_refiner.blocks.<idx>.attn`` and
 # anything else is not and stays dense.
 _DIT_LAYER_PREFIX = re.compile(r"^blocks\.(\d+)\.")
@@ -488,10 +531,43 @@ class _TileGeometry:
 
     num_prefix_tiles: int
     num_video_tiles: int
+    # Row bounds -> the tile each bound's rows are complete after; see
+    # ``tiles_through_rows``. Host ints, filled on first use.
+    _tiles_through: dict[tuple[int, ...], tuple[int, ...]] = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
     @property
     def num_tiles(self) -> int:
         return self.num_prefix_tiles + self.num_video_tiles
+
+    def tiles_through_rows(self, row_ends: tuple[int, ...]) -> tuple[int, ...]:
+        """For each row end, the first tile past every tile holding a row before it.
+
+        Once every tile before that one has run, rows ``[0, end)`` are final.
+        Never less than the prefix tiles, which run first, and the last end
+        always reaches every tile. A tile holds rows from several places --
+        a space-time cube spans frames, and a reference's tiles sit among the
+        video's -- so this is a running maximum over the rows' slots, taken
+        once per geometry and bounds and kept on the host: a device read per
+        layer would stall the launch queue the early rows are meant to fill.
+        """
+        cached = self._tiles_through.get(row_ends)
+        if cached is not None:
+            return cached
+        live = self.scatter_index.numel()
+        running = torch.cummax(self.scatter_index, dim=0).values
+        last_rows = [min(end, live) - 1 for end in row_ends]
+        slots = running[
+            torch.tensor([max(row, 0) for row in last_rows], device=running.device)
+        ].tolist()
+        ends = [
+            max(self.num_prefix_tiles, slot // BLOCK_SIZE + 1 if row >= 0 else 0)
+            for row, slot in zip(last_rows, slots)
+        ]
+        ends[-1] = self.num_tiles
+        self._tiles_through[row_ends] = result = tuple(ends)
+        return result
 
     @property
     def padded_rows(self) -> int:
@@ -1254,8 +1330,12 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         geometry: _TileGeometry,
-    ) -> torch.Tensor:
-        """Live ``[S, H, D]`` rows -> same shape, attention over tiles.
+        *,
+        out: torch.Tensor | None,
+        rows_ready: tuple[tuple[int, ...], Callable[[int], None]] | None = None,
+        fp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> None:
+        """Live ``[S, H, D]`` rows -> ``out``, attention over tiles.
 
         Two launches of the same kernel rather than one: prefix query tiles take
         every key tile and video query tiles take their selection, so splitting
@@ -1265,6 +1345,12 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
 
         Head slices are views, not copies -- every kernel here takes explicit
         strides -- so slicing costs nothing but the launches it adds.
+
+        With ``rows_ready`` the last head slice's video launch is cut where
+        each of its row bounds completes, and the callback told after each
+        piece: every query tile is computed on its own, so a launch over some
+        of them writes the same rows as one over all of them. ``fp8_out``,
+        Sage only, takes the rows as FP8 groups in place of ``out``.
         """
         heads = query.shape[-2]
         sizes = geometry.variable_block_sizes
@@ -1274,8 +1360,8 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         quantize = self.schedule.quantize
         quantize_pv = self.schedule.quantize_pv
         sage = self._sage_enabled(geometry.padded_rows)
-        out = torch.empty_like(query)
         chunk = self._head_chunk_for(geometry, heads, query.element_size())
+        last_start = max(start for start, _ in self._head_slices(heads, chunk))
 
         logger.info_once(
             f"VSA-H3 attention active: {tiles} tiles ({prefix_tiles} protected "
@@ -1291,7 +1377,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
             q_slice = query[:, start:stop]
             k_slice = key[:, start:stop]
             v_slice = value[:, start:stop]
-            out_slice = out[:, start:stop]
+            out_slice = None if out is None else out[:, start:stop]
 
             # The Sage kernel lays out and quantizes its own operands, in its
             # own layouts -- K per 64-token tile, Q per 32-row group, V
@@ -1362,6 +1448,11 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
                 device=query.device,
                 dtype=torch.int32,
             )
+            segments: tuple[int, ...] = (tiles,)
+            on_segment = None
+            if rows_ready is not None and start == last_start:
+                segments = geometry.tiles_through_rows(rows_ready[0])
+                on_segment = rows_ready[1]
 
             if sage:
                 # Same selection, same two launches, different executor: the
@@ -1378,6 +1469,13 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
                     q2k_index=q2k_index,
                     q2k_num=q2k_num,
                     softmax_scale=self.softmax_scale,
+                    video_segments=segments,
+                    on_segment=on_segment,
+                    fp8_out=(
+                        None
+                        if fp8_out is None
+                        else (fp8_out[0][:, start:stop], fp8_out[1][:, start:stop])
+                    ),
                 )
                 del q2k_index, q2k_num
                 continue
@@ -1412,33 +1510,35 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
                 )
                 del dense_index, dense_num
 
-            block_sparse_attn_forward(
-                q_slice,
-                key_tiled,
-                value_operand,
-                out_slice,
-                tile_rows,
-                q2k_index,
-                q2k_num,
-                sizes,
-                prefix_tiles,
-                key_scale,
-                value_scale,
-                value_mean,
-                self.softmax_scale,
-            )
+            first = prefix_tiles
+            for index, end in enumerate(segments):
+                if end > first:
+                    picked = slice(first - prefix_tiles, end - prefix_tiles)
+                    block_sparse_attn_forward(
+                        q_slice,
+                        key_tiled,
+                        value_operand,
+                        out_slice,
+                        tile_rows,
+                        # The kernel indexes the selection as contiguous.
+                        q2k_index[:, picked].contiguous(),
+                        q2k_num[:, picked].contiguous(),
+                        sizes,
+                        first,
+                        key_scale,
+                        value_scale,
+                        value_mean,
+                        self.softmax_scale,
+                    )
+                    first = end
+                if on_segment is not None:
+                    on_segment(index)
             del q2k_index, q2k_num, key_tiled, key_scale
             del value_scale, value_mean, value_operand
 
-        return out
-
-    def _attend(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        geometry: VsaH3SequenceGeometry,
-    ) -> torch.Tensor:
+    def _tiles_for(
+        self, geometry: VsaH3SequenceGeometry, device: torch.device
+    ) -> _TileGeometry:
         segments = geometry.prefix_segments
         references = geometry.reference_visuals
         text_pictures: tuple[tuple[int, tuple[int, int, int]], ...] = ()
@@ -1449,17 +1549,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         pictures = text_pictures
         if self.schedule.sparsify_references:
             pictures += references
-        return self._sparse_attention(
-            query,
-            key,
-            value,
-            _tile_geometry(
-                segments,
-                geometry.video_grid,
-                query.device,
-                pictures,
-            ),
-        )
+        return _tile_geometry(segments, geometry.video_grid, device, pictures)
 
     # ----------------------------------------------------------------- entries
 
@@ -1477,7 +1567,15 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
             geometry = self._geometry_for(rows)
         if geometry is None:
             return self.dense_impl.forward(query, key, value, attn_metadata)
-        return self._attend(query[0], key[0], value[0], geometry).unsqueeze(0)
+        out = torch.empty_like(query[0])
+        self._sparse_attention(
+            query[0],
+            key[0],
+            value[0],
+            self._tiles_for(geometry, query.device),
+            out=out,
+        )
+        return out.unsqueeze(0)
 
     def forward_varlen(
         self,
@@ -1523,12 +1621,70 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         if geometry is None:
             return all_dense()
 
-        live_out = self._attend(query[:used], key[:used], value[:used], geometry)
-        if used == query.shape[0]:
-            return live_out
-        out = torch.zeros_like(query)
-        out[:used] = live_out
+        tiles = self._tiles_for(geometry, query.device)
+        consumer = _rows_ready.get()
+        if consumer is not None and not _splits_rows(consumer[0], total):
+            consumer = None
+        live = (query[:used], key[:used], value[:used], tiles)
+        if (
+            consumer is not None
+            and consumer[2]
+            and self._sage_enabled(tiles.padded_rows)
+        ):
+            bounds, ready, _ = consumer
+            q8, scales = _fp8_rows(
+                total, used, query.shape[1], query.shape[2], device=query.device
+            )
+            self._sparse_attention(
+                *live,
+                out=None,
+                rows_ready=(bounds, lambda index: ready(index, (q8, scales))),
+                fp8_out=(q8[:used].view(used, *query.shape[1:]), scales[:used]),
+            )
+            # Every bound went out as FP8; nothing reads a bf16 row.
+            return query.new_empty(()).expand_as(query)
+
+        # The output is allocated whole and the live rows attended into it,
+        # so rows handed out early are rows of the tensor returned.
+        out = torch.empty_like(query)
+        out[used:].zero_()
+        rows_ready = None
+        if consumer is not None:
+            bounds, ready, _ = consumer
+            rows_ready = (bounds, lambda index: ready(index, out))
+        self._sparse_attention(*live, out=out[:used], rows_ready=rows_ready)
         return out
+
+
+def _fp8_rows(
+    total: int, used: int, heads: int, head_dim: int, *, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP8 output rows and per-head scales, the padding tail already filled.
+
+    The tail's bf16 rows would be zero, so it holds what quantizing zero rows
+    gives, from the quantizer the fused scatter reproduces.
+    """
+    q8 = torch.empty(
+        (total, heads * head_dim), device=device, dtype=torch.float8_e4m3fn
+    )
+    scales = torch.empty((total, heads), device=device, dtype=torch.float32)
+    if used < total:
+        q8[used:], scales[used:] = sglang_per_token_group_quant_fp8(
+            torch.zeros(
+                (total - used, heads * head_dim), device=device, dtype=torch.bfloat16
+            ),
+            head_dim,
+        )
+    return q8, scales
+
+
+def _splits_rows(bounds: tuple[int, ...], total: int) -> bool:
+    return (
+        bool(bounds)
+        and bounds[-1] == total
+        and all(0 < a < b for a, b in zip(bounds, bounds[1:]))
+        and bounds[0] > 0
+    )
 
 
 __all__ = [
@@ -1539,5 +1695,6 @@ __all__ = [
     "VsaH3Schedule",
     "VsaH3SequenceGeometry",
     "compute_topk",
+    "vsa_h3_rows_ready",
     "vsa_h3_sequence_geometry",
 ]
