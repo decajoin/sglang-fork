@@ -19,6 +19,7 @@ import torch.nn as nn
 from safetensors.torch import safe_open
 
 from sglang.kernels.ops.activation.activation import (
+    silu_and_mul_with_activation_rounding,
     silu_and_mul_with_activation_rounding_,
 )
 from sglang.kernels.ops.diffusion.qknorm_rope import (
@@ -30,6 +31,7 @@ from sglang.kernels.ops.diffusion.triton.indexed_modulation import (
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
 )
+from sglang.kernels.ops.diffusion.triton.silu_mul_quant_fp8 import silu_mul_quant_fp8
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
@@ -73,6 +75,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3_row_shard import (
     quantize_modulated,
     row_chunks,
     shard_rows,
+    takes_prequantized_input,
     unshard_rows,
 )
 from sglang.multimodal_gen.runtime.platforms import (
@@ -280,13 +283,18 @@ def _modulate_gate(
 
 def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
     if (
-        reuse_input
-        and hidden.is_cuda
+        hidden.is_cuda
         and hidden.dtype == _BF16_DTYPE
         and hidden.is_contiguous()
         and hidden.shape[-1] % 16 == 0
     ):
-        return silu_and_mul_with_activation_rounding_(hidden)
+        if reuse_input:
+            return silu_and_mul_with_activation_rounding_(hidden)
+        # The in-place kernel hands back a strided half of its input, which
+        # the FP8 linear's row view cannot take, so a quantized fc2 gets a
+        # fresh contiguous output instead -- one kernel where eager spends
+        # four, and bitwise equal to it.
+        return silu_and_mul_with_activation_rounding(hidden)
     gate, up = hidden.chunk(2, dim=-1)
     return nn.functional.silu(gate) * up
 
@@ -895,9 +903,28 @@ class MiniMaxH3MLP(nn.Module):
         row-sharded block stack gathers.
         """
         hidden, _ = self.fc1(x)
-        hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+        if self._quantize_activation_for_fc2(hidden):
+            # fc2 would quantize the activation the moment it got it, so it
+            # is quantized as it is computed and never written as bf16.
+            hidden = silu_mul_quant_fp8(
+                hidden,
+                group_size=self.fc2.quant_method.quant_config.weight_block_size[1],
+            )
+        else:
+            hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
+
+    def _quantize_activation_for_fc2(self, hidden: torch.Tensor) -> bool:
+        # Checked per call: a LoRA wrapper can replace fc2 after construction.
+        return (
+            not self.reuse_fc1_activation
+            and hidden.is_cuda
+            and hidden.dtype == _BF16_DTYPE
+            and hidden.is_contiguous()
+            and not torch.compiler.is_compiling()
+            and takes_prequantized_input(self.fc2)
+        )
 
 
 class MiniMaxH3AdalnProj(nn.Module):

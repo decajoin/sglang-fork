@@ -165,3 +165,56 @@ def test_chunk_count_backs_off_to_what_the_rows_divide_into():
     assert row_chunks(column_linears=(), tp_size=2, rows=12) == 0
     # Only TP=2 is claimed bit-exact.
     assert row_chunks(column_linears=(), tp_size=4, rows=64 * 7) == 0
+
+
+def _silu_mul_unfused(x):
+    from sglang.kernels.ops.activation.activation import (
+        silu_and_mul_with_activation_rounding,
+    )
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    return sglang_per_token_group_quant_fp8(
+        silu_and_mul_with_activation_rounding(x), GROUP
+    )
+
+
+def test_fused_silu_mul_quant_covers_every_gate_value():
+    # The activation depends on the bf16 gate alone, so all 65536 of them pin
+    # it; up = 1 keeps the product exact, and a random up then checks the
+    # multiply. NaN gates are left out: their payload is not a contract.
+    from sglang.kernels.ops.diffusion.triton.silu_mul_quant_fp8 import (
+        silu_mul_quant_fp8,
+    )
+
+    torch.manual_seed(0)
+    gates = torch.arange(-32768, 32768, dtype=torch.int32).to(torch.int16)
+    gates = gates.view(torch.bfloat16).cuda()
+    gates = gates[~torch.isnan(gates)]
+    # Two groups a row at least: with a single group sglang dispatches a
+    # per-token quantizer that skips the 1e-10 floor, which H3's widths never
+    # reach.
+    width = 2 * GROUP
+    gates = torch.cat([gates, gates.new_zeros(-gates.numel() % width)]).view(-1, width)
+    for up in (torch.ones_like(gates), torch.randn_like(gates.float()).bfloat16()):
+        x = torch.cat([gates, up], dim=1).contiguous()
+        expected_q, expected_scale = _silu_mul_unfused(x)
+        q, q_scale = silu_mul_quant_fp8(x, group_size=GROUP)
+        assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
+        assert torch.equal(q_scale.view(torch.int32), expected_scale.view(torch.int32))
+
+
+@pytest.mark.parametrize("case", ["normal", "heavy_tailed", "zero_and_tiny"])
+def test_fused_silu_mul_quant_is_bit_exact_at_mlp_width(case):
+    from sglang.kernels.ops.diffusion.triton.silu_mul_quant_fp8 import (
+        silu_mul_quant_fp8,
+    )
+
+    x = _cases()[case][0]
+    # [gate | up] halves of an fc1 output, 7168 wide each at TP=2.
+    x = torch.cat([x, x.flip(0)], dim=1)[:, : 2 * 7168].contiguous()
+    expected_q, expected_scale = _silu_mul_unfused(x)
+    q, q_scale = silu_mul_quant_fp8(x, group_size=GROUP)
+    assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
+    assert torch.equal(q_scale.view(torch.int32), expected_scale.view(torch.int32))
