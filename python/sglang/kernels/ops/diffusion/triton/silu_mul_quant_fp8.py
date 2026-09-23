@@ -18,7 +18,11 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
-from sglang.kernels.ops.diffusion.triton.fp8_group_quant import quantize_fp8_groups
+from sglang.kernels.ops.diffusion.triton.fp8_group_quant import (
+    pack_ue8m0,
+    quantize_fp8_groups,
+    quantize_fp8_groups_ue8m0,
+)
 from sglang.kernels.ops.diffusion.triton.numerics import div_rn_f32, mul_rn_f32
 
 
@@ -34,6 +38,7 @@ def _silu_mul_quant_fp8_kernel(
     stride_q_scale_row,
     GROUP_SIZE: tl.constexpr,
     BLOCK_GROUPS: tl.constexpr,
+    SCALE_UE8M0: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     groups = tl.program_id(1) * BLOCK_GROUPS + tl.arange(0, BLOCK_GROUPS)
@@ -51,27 +56,38 @@ def _silu_mul_quant_fp8_kernel(
     activated = activated.to(tl.bfloat16).to(tl.float32)
     product = mul_rn_f32(activated, up).to(tl.bfloat16).to(tl.float32)
 
-    q, q_scale = quantize_fp8_groups(product)
+    if SCALE_UE8M0:
+        q, exponent = quantize_fp8_groups_ue8m0(product)
+        packs = tl.program_id(1) * (BLOCK_GROUPS // 4) + tl.arange(0, BLOCK_GROUPS // 4)
+        tl.store(
+            q_scale_ptr + row * stride_q_scale_row + packs,
+            pack_ue8m0(exponent, groups < num_groups, BLOCK_GROUPS),
+            mask=packs < tl.cdiv(num_groups, 4),
+        )
+    else:
+        q, q_scale = quantize_fp8_groups(product)
+        tl.store(
+            q_scale_ptr + row * stride_q_scale_row + groups,
+            q_scale,
+            mask=groups < num_groups,
+        )
     tl.store(
         q_ptr + row * stride_q_row + columns,
         q.to(q_ptr.dtype.element_ty),
         mask=mask,
     )
-    tl.store(
-        q_scale_ptr + row * stride_q_scale_row + groups,
-        q_scale,
-        mask=groups < num_groups,
-    )
 
 
 def silu_mul_quant_fp8(
-    x: torch.Tensor, *, group_size: int
+    x: torch.Tensor, *, group_size: int, scale_ue8m0: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``[rows, 2 * width]`` bf16 ``[gate | up]`` -> ``(fp8 rows, scales)``.
 
     The pair ``sglang_per_token_group_quant_fp8`` returns for the rows
     ``silu_and_mul_with_activation_rounding`` would have written: ``[rows,
-    width]`` e4m3 and ``[rows, width // group_size]`` row-major fp32 scales.
+    width]`` e4m3 and ``[rows, width // group_size]`` row-major fp32 scales,
+    or with ``scale_ue8m0`` the UE8M0 exponents that quantizer packs for
+    DeepGEMM, four groups to an int32 but row-major.
     """
     if not (x.is_cuda and x.dtype == torch.bfloat16 and x.is_contiguous()):
         raise ValueError("silu_mul_quant_fp8 needs contiguous CUDA bf16 rows")
@@ -83,7 +99,11 @@ def silu_mul_quant_fp8(
         )
     num_groups = width // group_size
     q = torch.empty((rows, width), device=x.device, dtype=torch.float8_e4m3fn)
-    q_scale = torch.empty((rows, num_groups), device=x.device, dtype=torch.float32)
+    q_scale = (
+        torch.empty((rows, -(-num_groups // 4)), device=x.device, dtype=torch.int32)
+        if scale_ue8m0
+        else torch.empty((rows, num_groups), device=x.device, dtype=torch.float32)
+    )
     if rows == 0:
         return q, q_scale
     block_groups = 8
@@ -98,6 +118,7 @@ def silu_mul_quant_fp8(
         q_scale.stride(0),
         GROUP_SIZE=group_size,
         BLOCK_GROUPS=block_groups,
+        SCALE_UE8M0=scale_ue8m0,
         num_warps=4,
     )
     return q, q_scale

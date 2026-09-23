@@ -27,7 +27,10 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.kernels.ops.diffusion.triton.fp8_group_quant import quantize_fp8_groups
+from sglang.kernels.ops.diffusion.triton.fp8_group_quant import (
+    quantize_fp8_groups,
+    quantize_fp8_groups_ue8m0,
+)
 
 BLOCK_SIZE = 64
 SAGE_Q_GROUP_SIZE = 32
@@ -326,6 +329,7 @@ def _scatter_tile_rows_fp8_kernel(
     scale_stride_h,
     first_tile,
     HEAD_DIM: tl.constexpr,
+    SCALE_UE8M0: tl.constexpr,
 ):
     """``_scatter_tile_rows_kernel``, quantized on the way out.
 
@@ -333,6 +337,8 @@ def _scatter_tile_rows_fp8_kernel(
     quantization when the group is a head wide, so each row this program
     scatters is quantized whole, the way ``fp8_group_quant`` reproduces
     sglang's quantizer, from the same bf16 values the plain scatter stores.
+    With ``SCALE_UE8M0`` it stores the group's exponent byte, into the bytes
+    of the packed int32 scales, where head ``h``'s is byte ``h`` of its row.
     """
     tile = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -347,7 +353,11 @@ def _scatter_tile_rows_fp8_kernel(
         + (tile * 64 + local)[:, None] * result_stride_s
         + dim_idx[None, :]
     ).to(tl.float32)
-    q, q_scale = quantize_fp8_groups(values)
+    if SCALE_UE8M0:
+        q, exponent = quantize_fp8_groups_ue8m0(values)
+        q_scale = exponent.to(tl.uint8)
+    else:
+        q, q_scale = quantize_fp8_groups(values)
     tl.store(
         q_ptr + packed[:, None] * q_stride_s + head_idx * q_stride_h + dim_idx[None, :],
         q.to(q_ptr.dtype.element_ty),
@@ -522,7 +532,8 @@ def scatter_tile_rows_fp8(
 
     ``q_out`` is packed ``[S, H, D]`` e4m3 and ``scale_out`` ``[S, H]`` fp32:
     what ``sglang_per_token_group_quant_fp8`` gives for the bf16 rows with a
-    group of ``D``, bit for bit.
+    group of ``D``, bit for bit. A uint8 ``scale_out`` is the byte view of
+    packed UE8M0 scales, and gets that quantizer's UE8M0 exponents.
     """
     heads, rows, head_dim = result.shape[1], result.shape[2], result.shape[3]
     _scatter_tile_rows_fp8_kernel[(rows // BLOCK_SIZE, heads)](
@@ -539,6 +550,7 @@ def scatter_tile_rows_fp8(
         scale_out.stride(1),
         first_tile,
         HEAD_DIM=head_dim,
+        SCALE_UE8M0=scale_out.dtype == torch.uint8,
         num_warps=4,
     )
 

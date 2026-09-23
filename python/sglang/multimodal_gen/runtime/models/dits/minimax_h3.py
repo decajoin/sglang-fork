@@ -7,6 +7,7 @@ contract accepts packed inference keyword arguments and returns packed logits.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
 import os
@@ -74,7 +75,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_row_shard import (
     comm_lane,
+    gemms_beside_collectives,
     linear_into,
+    prequantized_scale_ue8m0,
     quantize_modulated,
     row_chunks,
     shard_rows,
@@ -912,6 +915,7 @@ class MiniMaxH3MLP(nn.Module):
             hidden = silu_mul_quant_fp8(
                 hidden,
                 group_size=self.fc2.quant_method.quant_config.weight_block_size[1],
+                scale_ue8m0=prequantized_scale_ue8m0(self.fc2),
             )
         else:
             hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
@@ -1533,13 +1537,20 @@ class MiniMaxH3DiTBlock(nn.Module):
             reduced.append(lane.reduce_scatter(partial, group=self.attn.tp_group))
 
         # Where the projection quantizes a head per group, the attention can
-        # hand its rows over quantized and skip writing them as bf16.
+        # hand its rows over quantized, in the projection's scale format, and
+        # skip writing them as bf16.
+        scale_ue8m0 = prequantized_scale_ue8m0(out_proj)
         fp8 = (
-            takes_prequantized_input(out_proj)
+            scale_ue8m0 is not None
             and out_proj.quant_method.quant_config.weight_block_size[1]
             == self.attn.head_dim
         )
-        with vsa_h3_rows_ready(tuple(span.stop for span in rows), project, fp8=fp8):
+        with vsa_h3_rows_ready(
+            tuple(span.stop for span in rows),
+            project,
+            fp8=fp8,
+            scale_ue8m0=bool(scale_ue8m0),
+        ):
             attended = self.attn.attend(
                 qkv,
                 rope_cache=rope_cache,
@@ -2428,7 +2439,12 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 world=get_tp_world_size(),
             )
             hidden, stack_indices = shard(hidden), shard(block_combined)
-        with _row_modality_tags_ctx(
+        beside_collectives = (
+            gemms_beside_collectives(self.blocks[0].attn.qkv_proj)
+            if chunks
+            else contextlib.nullcontext()
+        )
+        with beside_collectives, _row_modality_tags_ctx(
             _attention_row_modality_tags(
                 sp_ws=sp_ws,
                 block_token_tags=block_token_tags,

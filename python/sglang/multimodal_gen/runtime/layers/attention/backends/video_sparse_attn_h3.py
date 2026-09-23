@@ -94,6 +94,7 @@ from typing import Any, Callable, Iterator
 import msgspec
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -121,7 +122,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3.sm120_sage i
     sm120_sage_attention,
     sm120_sage_available,
 )
-from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -405,14 +405,18 @@ def vsa_h3_sequence_geometry(
 AttentionRows = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 RowsReady = Callable[[int, AttentionRows], None]
 
-_rows_ready: ContextVar[tuple[tuple[int, ...], RowsReady, bool] | None] = ContextVar(
-    "vsa_h3_rows_ready", default=None
+_rows_ready: ContextVar[tuple[tuple[int, ...], RowsReady, bool, bool] | None] = (
+    ContextVar("vsa_h3_rows_ready", default=None)
 )
 
 
 @contextmanager
 def vsa_h3_rows_ready(
-    bounds: tuple[int, ...], ready: RowsReady, *, fp8: bool = False
+    bounds: tuple[int, ...],
+    ready: RowsReady,
+    *,
+    fp8: bool = False,
+    scale_ue8m0: bool = False,
 ) -> Iterator[None]:
     """Hand the caller leading rows of the next attention output early.
 
@@ -430,13 +434,15 @@ def vsa_h3_rows_ready(
 
     ``fp8`` asks for the rows as the FP8 input of a projection that quantizes
     per token in groups of one head: ``rows`` is then ``(fp8 [T, H * D],
-    fp32 scales [T, H])``, bit for bit what quantizing the bf16 rows gives. A
-    call that can oblige -- the Sage kernel's -- hands out every bound that
+    fp32 scales [T, H])``, bit for bit what quantizing the bf16 rows gives,
+    or with ``scale_ue8m0`` the UE8M0 exponents of that quantization packed
+    four heads to an int32, ``[T, ceil(H / 4)]`` row-major. A call that can
+    oblige -- the Sage kernel's -- hands out every bound that
     way and writes no bf16 rows, so the tensor it returns is a placeholder of
     the right shape that holds nothing; one that cannot hands out bf16 rows,
     or none.
     """
-    token = _rows_ready.set((bounds, ready, fp8))
+    token = _rows_ready.set((bounds, ready, fp8, scale_ue8m0))
     try:
         yield
     finally:
@@ -1631,15 +1637,23 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
             and consumer[2]
             and self._sage_enabled(tiles.padded_rows)
         ):
-            bounds, ready, _ = consumer
+            bounds, ready, _, scale_ue8m0 = consumer
             q8, scales = _fp8_rows(
-                total, used, query.shape[1], query.shape[2], device=query.device
+                total,
+                used,
+                query.shape[1],
+                query.shape[2],
+                device=query.device,
+                scale_ue8m0=scale_ue8m0,
             )
+            # UE8M0 exponents are written a byte per head into the packed
+            # int32s, so a head slice owns its bytes whatever its bounds.
+            written = scales.view(torch.uint8) if scale_ue8m0 else scales
             self._sparse_attention(
                 *live,
                 out=None,
                 rows_ready=(bounds, lambda index: ready(index, (q8, scales))),
-                fp8_out=(q8[:used].view(used, *query.shape[1:]), scales[:used]),
+                fp8_out=(q8[:used].view(used, *query.shape[1:]), written[:used]),
             )
             # Every bound went out as FP8; nothing reads a bf16 row.
             return query.new_empty(()).expand_as(query)
@@ -1650,30 +1664,45 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         out[used:].zero_()
         rows_ready = None
         if consumer is not None:
-            bounds, ready, _ = consumer
+            bounds, ready, _, _ = consumer
             rows_ready = (bounds, lambda index: ready(index, out))
         self._sparse_attention(*live, out=out[:used], rows_ready=rows_ready)
         return out
 
 
 def _fp8_rows(
-    total: int, used: int, heads: int, head_dim: int, *, device: torch.device
+    total: int,
+    used: int,
+    heads: int,
+    head_dim: int,
+    *,
+    device: torch.device,
+    scale_ue8m0: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """FP8 output rows and per-head scales, the padding tail already filled.
 
     The tail's bf16 rows would be zero, so it holds what quantizing zero rows
-    gives, from the quantizer the fused scatter reproduces.
+    gives, from the quantizer the fused scatter reproduces. UE8M0 scales start
+    zeroed, so the pad bytes of a head count that is not a multiple of four
+    are the zeros that quantizer packs there.
     """
     q8 = torch.empty(
         (total, heads * head_dim), device=device, dtype=torch.float8_e4m3fn
     )
-    scales = torch.empty((total, heads), device=device, dtype=torch.float32)
+    scales = (
+        torch.zeros((total, -(-heads // 4)), device=device, dtype=torch.int32)
+        if scale_ue8m0
+        else torch.empty((total, heads), device=device, dtype=torch.float32)
+    )
     if used < total:
         q8[used:], scales[used:] = sglang_per_token_group_quant_fp8(
             torch.zeros(
                 (total - used, heads * head_dim), device=device, dtype=torch.bfloat16
             ),
             head_dim,
+            column_major_scales=scale_ue8m0,
+            scale_tma_aligned=scale_ue8m0,
+            scale_ue8m0=scale_ue8m0,
         )
     return q8, scales
 

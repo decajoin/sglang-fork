@@ -1363,7 +1363,16 @@ class TestVsaH3EarlyRows(unittest.TestCase):
 
     PAD = 64 * 3
 
-    def _run(self, kernel, geometry, *, head_chunk=0, bounds=None, fp8=False):
+    def _run(
+        self,
+        kernel,
+        geometry,
+        *,
+        head_chunk=0,
+        bounds=None,
+        fp8=False,
+        scale_ue8m0=False,
+    ):
         torch.manual_seed(0)
         device = torch.device("cuda")
         rows = geometry.live_rows
@@ -1403,7 +1412,7 @@ class TestVsaH3EarlyRows(unittest.TestCase):
             )
             if bounds is None:
                 return call(), seen
-            with vsa_h3_rows_ready(bounds, ready, fp8=fp8):
+            with vsa_h3_rows_ready(bounds, ready, fp8=fp8, scale_ue8m0=scale_ue8m0):
                 return call(), seen
 
     def _check(self, kernel, geometry, **kwargs):
@@ -1470,6 +1479,41 @@ class TestVsaH3EarlyRows(unittest.TestCase):
                     scale.view(torch.int32), expected_scale[:end].view(torch.int32)
                 )
             )
+
+    @requires_sage
+    def test_sage_hands_out_ue8m0_rows_that_quantize_the_bf16_ones(self):
+        # The same for a DeepGEMM projection: packed UE8M0 exponents, written a
+        # byte per head, so head slices of three share an int32 between them.
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        geometry = _ref_geometry()
+        bounds = self._bounds(geometry)
+        whole, _ = self._run("flashinfer", geometry, head_chunk=3)
+        _, seen = self._run(
+            "flashinfer",
+            geometry,
+            head_chunk=3,
+            bounds=bounds,
+            fp8=True,
+            scale_ue8m0=True,
+        )
+        expected_q, expected_scale = sglang_per_token_group_quant_fp8(
+            whole.reshape(whole.shape[0], -1),
+            HEAD_DIM,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+        )
+        self.assertEqual([index for index, _ in seen], list(range(len(bounds))))
+        for index, (q, scale) in seen:
+            end = bounds[index]
+            self.assertEqual(scale.dtype, torch.int32)
+            self.assertTrue(
+                torch.equal(q.view(torch.uint8), expected_q[:end].view(torch.uint8))
+            )
+            self.assertTrue(torch.equal(scale, expected_scale[:end]))
 
     def test_triton_hands_out_bf16_even_when_fp8_is_asked(self):
         geometry = _geometry()

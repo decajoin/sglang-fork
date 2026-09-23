@@ -13,6 +13,13 @@ inverse, one fp32 multiply, a clamp at +448 and a saturating RNE cast.
 Flush-to-zero, which that build has and this one does not, only touches
 products far below e4m3's smallest subnormal, which cast to the same signed
 zero either way.
+
+Its UE8M0 flavour, what DeepGEMM takes on SM100 and SM120, keeps the absmax,
+the floor and ``amax * (1 / 448)``, then rounds that scale up to a power of two
+by its bits -- the biased exponent, plus one unless the mantissa is zero -- and
+multiplies by the exact inverse power of two, so no division is left to
+approximate. The exponent bytes go four groups to an int32, the first group in
+the low byte, and bytes past the last group are zero.
 """
 
 import triton
@@ -37,3 +44,24 @@ def quantize_fp8_groups(values):
     amax = tl.maximum(tl.max(tl.abs(values), axis=1), QUANT_EPS)
     inverse = div_approx_ftz_f32(tl.full(amax.shape, FP8_MAX, tl.float32), amax)
     return tl.minimum(values * inverse[:, None], FP8_MAX), amax * FP8_MAX_INV
+
+
+@triton.jit
+def quantize_fp8_groups_ue8m0(values):
+    """``[groups, group_size]`` fp32 holding bf16 values -> (clamped, exponents).
+
+    Cast the first to the FP8 dtype on store; the second is each group's
+    biased UE8M0 exponent, for ``pack_ue8m0``.
+    """
+    amax = tl.maximum(tl.max(tl.abs(values), axis=1), QUANT_EPS)
+    bits = (amax * FP8_MAX_INV).to(tl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    inverse = ((254 - exponent) << 23).to(tl.float32, bitcast=True)
+    return tl.minimum(values * inverse[:, None], FP8_MAX), exponent
+
+
+@triton.jit
+def pack_ue8m0(exponent, valid, GROUPS: tl.constexpr):
+    """``[GROUPS]`` exponents -> ``[GROUPS // 4]`` int32, zero past ``valid``."""
+    exponent = tl.reshape(tl.where(valid, exponent, 0), [GROUPS // 4, 4])
+    return tl.sum(exponent << (tl.arange(0, 4) * 8)[None, :], axis=1)

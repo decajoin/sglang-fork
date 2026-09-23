@@ -32,7 +32,11 @@ It is bit-exact against the all-reduce path, not an approximation of it:
 The GEMM's input quantization moves out of the linear layer to make this
 possible, so the path is taken only where that layer's own quantization is
 exactly the one reproduced here: block-FP8 weights on FlashInfer's CUTLASS
-groupwise GEMM, which is what an SM120 card dispatches to. Anything else --
+groupwise GEMM with fp32 group scales, or on DeepGEMM with the packed UE8M0
+scales it takes on SM100 and SM120, whose GEMM likewise gives every row the
+same bits whatever M it is handed. The UE8M0 scales travel row-major, so the
+all-gather stacks them by rows like the FP8 rows, and turn into DeepGEMM's
+MN-major layout only at the GEMM. Anything else --
 another runner, a LoRA-wrapped QKV or fc1, bf16 weights, where gathering bf16
 would cost more than the all-reduce saves -- keeps the all-reduce. A LoRA on
 the output projection or fc2 does not stand in the way: it adds its delta to
@@ -43,7 +47,9 @@ than from a layer a wrapper may have replaced.
 
 from __future__ import annotations
 
+import contextlib
 import functools
+import os
 from typing import Callable
 
 import torch
@@ -60,6 +66,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization import fp8_utils
 
 # Chunks per pass through the row-local stretch. Four hides all but the first
@@ -70,28 +77,77 @@ _MAX_ROW_CHUNKS = 4
 _GEMM_ROW_ALIGNMENT = 4
 
 
-def takes_prequantized_input(linear: nn.Module) -> bool:
-    """Whether this layer can be handed its input already FP8-quantized.
+def prequantized_scale_ue8m0(linear: nn.Module) -> bool | None:
+    """How this layer takes its input already FP8-quantized, if it does.
 
-    True where the layer's own quantization is sglang's per-token-group
-    quantizer feeding FlashInfer's CUTLASS groupwise GEMM, which the fused
-    kernels reproduce bit for bit, so quantizing ahead of the layer changes
-    nothing but where it happens.
+    ``False`` for fp32 group scales, where the layer's runner is FlashInfer's
+    CUTLASS groupwise GEMM; ``True`` for packed UE8M0 scales, where it is
+    DeepGEMM scaling in UE8M0; ``None`` otherwise. Either way the layer's own
+    quantization is sglang's per-token-group quantizer in that flavour, which
+    the fused kernels reproduce bit for bit, so quantizing ahead of the layer
+    changes nothing but where it happens.
     """
     # A LoRA wrapper is neither, and it has to see the bf16 input to compute
     # its own delta, so it keeps quantizing inside the layer.
     if not isinstance(linear, (ColumnParallelLinear, RowParallelLinear)):
-        return False
+        return None
     method = linear.quant_method
-    return (
+    if not (
         isinstance(method, Fp8LinearMethod)
         and method.block_quant
         and not method.use_marlin
-        and method.w8a8_block_fp8_linear
-        is fp8_utils.flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
+    ):
+        return None
+    runner = method.w8a8_block_fp8_linear
+    if (
+        runner is fp8_utils.flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
         # Its TRTLLM backend quantizes into a different scale layout.
         and fp8_utils._get_flashinfer_groupwise_backend() == "cutlass"
+    ):
+        return False
+    if (
+        runner is fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback
+        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        # Requantized at load; a layer DeepGEMM cannot run falls back to
+        # Triton with fp32 scales and keeps quantizing for itself.
+        and linear.weight_scale_inv.dtype == torch.int32
+    ):
+        return True
+    return None
+
+
+def takes_prequantized_input(linear: nn.Module) -> bool:
+    """Whether this layer can be handed its input already FP8-quantized."""
+    return prequantized_scale_ue8m0(linear) is not None
+
+
+# SMs the side stream's NCCL kernels hold while a GEMM runs: one block per
+# channel, and NCCL_MIN_NCHANNELS is how many channels H3's collectives get.
+_DEFAULT_NCCL_CHANNELS = 8
+
+
+def gemms_beside_collectives(linear: nn.Module) -> contextlib.AbstractContextManager:
+    """Size DeepGEMM's grid to the SMs NCCL leaves free, where it runs ``linear``.
+
+    DeepGEMM's GEMM is persistent, one CTA per SM for as many SMs as it is
+    told there are, so with NCCL on the side stream the CTAs of the SMs NCCL
+    holds wait for them and the whole GEMM finishes that much later; measured
+    at TP=2 on RTX 5090s over FL2VA's steady step, telling it 170, 166, 162,
+    160 and 154 SMs gives 9.55, 9.43, 9.17, 9.21 and 9.30 s with 8 NCCL
+    channels. Each output tile is still computed by one CTA in one pass over
+    K, so the count moves where a tile runs, not what it holds.
+    """
+    if prequantized_scale_ue8m0(linear) is not True:
+        return contextlib.nullcontext()
+    channels = int(os.environ.get("NCCL_MIN_NCHANNELS", _DEFAULT_NCCL_CHANNELS))
+    return deep_gemm_wrapper.configure_deep_gemm_num_sms(
+        _num_sms(linear.weight.device) - channels
     )
+
+
+@functools.cache
+def _num_sms(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 def row_chunks(
@@ -106,7 +162,9 @@ def row_chunks(
     input. Only TP=2 is claimed: beyond two ranks the ring's summation order is
     NCCL's to choose and need not match between the two collectives.
     """
-    if tp_size != 2 or not all(takes_prequantized_input(l) for l in column_linears):
+    if tp_size != 2 or not all(
+        takes_prequantized_input(linear) for linear in column_linears
+    ):
         return 0
     for chunks in range(_MAX_ROW_CHUNKS, 0, -1):
         if rows % (chunks * tp_size * _GEMM_ROW_ALIGNMENT) == 0:
@@ -231,6 +289,7 @@ def quantize_modulated(
         scale,
         indices,
         group_size=linear.quant_method.quant_config.weight_block_size[1],
+        scale_ue8m0=prequantized_scale_ue8m0(linear),
     )
 
 
@@ -240,7 +299,7 @@ def linear_into(
     out: torch.Tensor,
 ) -> None:
     """``linear`` over a pre-quantized input, written into ``out``'s rows."""
-    fp8_utils.flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
+    linear.quant_method.w8a8_block_fp8_linear(
         pair[0],
         linear.weight,
         linear.quant_method.quant_config.weight_block_size,

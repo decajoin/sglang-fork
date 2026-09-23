@@ -4,7 +4,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.diffusion.triton.fp8_group_quant import quantize_fp8_groups
+from sglang.kernels.ops.diffusion.triton.fp8_group_quant import (
+    pack_ue8m0,
+    quantize_fp8_groups,
+    quantize_fp8_groups_ue8m0,
+)
 from sglang.kernels.ops.diffusion.triton.numerics import round_bf16_to_fp32
 
 
@@ -63,6 +67,7 @@ def _indexed_scale_shift_quant_fp8_kernel(
     stride_q_scale_row,
     GROUP_SIZE: tl.constexpr,
     BLOCK_GROUPS: tl.constexpr,
+    SCALE_UE8M0: tl.constexpr,
 ):
     """``_indexed_scale_shift_bf16_kernel`` then per-token-group FP8 quant.
 
@@ -90,16 +95,25 @@ def _indexed_scale_shift_quant_fp8_kernel(
     scaled = round_bf16_to_fp32(x * one_plus_scale)
     modulated = (scaled + shift).to(tl.bfloat16).to(tl.float32)
 
-    q, q_scale = quantize_fp8_groups(modulated)
+    if SCALE_UE8M0:
+        q, exponent = quantize_fp8_groups_ue8m0(modulated)
+        packs = tl.arange(0, BLOCK_GROUPS // 4)
+        tl.store(
+            q_scale_ptr + row * stride_q_scale_row + packs,
+            pack_ue8m0(exponent, groups < num_groups, BLOCK_GROUPS),
+            mask=packs < tl.cdiv(num_groups, 4),
+        )
+    else:
+        q, q_scale = quantize_fp8_groups(modulated)
+        tl.store(
+            q_scale_ptr + row * stride_q_scale_row + groups,
+            q_scale,
+            mask=groups < num_groups,
+        )
     tl.store(
         q_ptr + row * stride_q_row + columns,
         q.to(q_ptr.dtype.element_ty),
         mask=mask,
-    )
-    tl.store(
-        q_scale_ptr + row * stride_q_scale_row + groups,
-        q_scale,
-        mask=groups < num_groups,
     )
 
 
@@ -175,12 +189,15 @@ def indexed_scale_shift_quant_fp8(
     indices: torch.Tensor,
     *,
     group_size: int,
+    scale_ue8m0: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``indexed_scale_shift_bf16_`` then ``sglang_per_token_group_quant_fp8``.
 
     Returns the same ``(fp8 rows, row-major per-group fp32 scales)`` pair those
     two calls produce, bit for bit, without writing the modulated rows back.
-    ``x`` is left untouched.
+    With ``scale_ue8m0`` the scales are the UE8M0 exponents that quantizer
+    packs for DeepGEMM, four groups to an int32, ``[rows, ceil(groups / 4)]``
+    but row-major. ``x`` is left untouched.
     """
     # The unfused modulation takes its fused kernel only for contiguous bf16
     # rows and bf16 parameters, falling back to torch arithmetic otherwise;
@@ -203,7 +220,11 @@ def indexed_scale_shift_quant_fp8(
         )
     num_groups = hidden_size // group_size
     q = torch.empty((rows, hidden_size), device=x.device, dtype=torch.float8_e4m3fn)
-    q_scale = torch.empty((rows, num_groups), device=x.device, dtype=torch.float32)
+    q_scale = (
+        torch.empty((rows, -(-num_groups // 4)), device=x.device, dtype=torch.int32)
+        if scale_ue8m0
+        else torch.empty((rows, num_groups), device=x.device, dtype=torch.float32)
+    )
     if rows == 0:
         return q, q_scale
     _indexed_scale_shift_quant_fp8_kernel[(rows,)](
@@ -221,7 +242,8 @@ def indexed_scale_shift_quant_fp8(
         q.stride(0),
         q_scale.stride(0),
         GROUP_SIZE=group_size,
-        BLOCK_GROUPS=triton.next_power_of_2(num_groups),
+        BLOCK_GROUPS=max(triton.next_power_of_2(num_groups), 4),
+        SCALE_UE8M0=scale_ue8m0,
         num_warps=8,
     )
     return q, q_scale
