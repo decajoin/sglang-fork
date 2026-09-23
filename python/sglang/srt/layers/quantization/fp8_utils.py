@@ -1472,9 +1472,21 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
     assert isinstance(weight, torch.nn.Parameter)
     assert isinstance(weight_scale_inv, torch.nn.Parameter)
 
-    new_weight, new_weight_scale_inv = requant_weight_ue8m0(
-        weight.to(weight_scale_inv.device), weight_scale_inv, weight_block_size
+    device = weight_scale_inv.device
+    # A layer loaded straight to host memory (layerwise offload) is requantized
+    # on the GPU, since DeepGEMM packs the scales with a CUDA kernel, and put
+    # back where it was; ``to`` keeps the packed scales' MN-major strides.
+    compute = (
+        torch.device("cuda", torch.cuda.current_device())
+        if device.type == "cpu" and torch.cuda.is_available()
+        else device
     )
+    new_weight, new_weight_scale_inv = requant_weight_ue8m0(
+        weight.to(compute), weight_scale_inv.to(compute), weight_block_size
+    )
+    if compute != device:
+        new_weight = new_weight.to(device)
+        new_weight_scale_inv = new_weight_scale_inv.to(device)
 
     offloader.update_param(weight, new_weight)
     weight_scale_inv.data = new_weight_scale_inv
