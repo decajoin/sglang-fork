@@ -1,6 +1,7 @@
 """Unit tests for hybrid HiCache pool assembly."""
 
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +15,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _MambaStrategy,
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
+    _resolve_mamba_host_ratio,
     _split_hicache_size,
     _SwaStrategy,
     build_full_draft_pools,
@@ -101,6 +103,150 @@ class TestSplitHicacheSize(CustomTestCase):
         )
         self.assertEqual(shares, (55.0, 25.0, 20.0))  # proportional to device KV bytes
         self.assertEqual(sum(shares), 100)  # total budget preserved, not doubled
+
+
+class TestResolveMambaHostRatio(CustomTestCase):
+    def _resolve(self, value, *, host_kv_tokens=988928, device_states=40, chunk=4096):
+        memory = SimpleNamespace(hicache_mamba_ratio=value, hicache_ratio=2.0)
+        schedule = SimpleNamespace(chunked_prefill_size=chunk, max_running_requests=9)
+        with (
+            patch(_ASSEMBLER + "get_memory", return_value=memory),
+            patch(_ASSEMBLER + "get_schedule", return_value=schedule),
+        ):
+            return _resolve_mamba_host_ratio(
+                SimpleNamespace(size=host_kv_tokens),
+                SimpleNamespace(size=device_states),
+            )
+
+    def test_unset_follows_hicache_ratio(self):
+        self.assertIsNone(self._resolve(None))
+
+    def test_explicit_ratio(self):
+        self.assertEqual(self._resolve("6"), 6.0)
+
+    def test_rejects_garbage(self):
+        with self.assertRaisesRegex(ValueError, "number or 'auto'"):
+            self._resolve("lots")
+
+    def test_rejects_nonpositive_and_nonfinite_ratios(self):
+        for value in ("0", "-1", "nan", "inf", "-inf"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "finite and positive"):
+                    self._resolve(value)
+
+    def test_auto_rejects_empty_device_pool(self):
+        with self.assertRaisesRegex(ValueError, "nonempty device pool"):
+            self._resolve("auto", device_states=0)
+
+    def test_auto_covers_every_host_chunk(self):
+        # ceil(988928 / 4096) = 242 chunk states + 9 running requests
+        ratio = self._resolve("auto")
+        self.assertEqual(int(40 * ratio) + 1, 251)
+
+    def test_auto_tracks_chunk_size(self):
+        ratio = self._resolve("auto", chunk=8192)
+        self.assertEqual(int(40 * ratio) + 1, 121 + 9)
+
+    def test_auto_never_below_device_pool(self):
+        ratio = self._resolve("auto", host_kv_tokens=4096)
+        self.assertEqual(int(40 * ratio) + 1, 41)
+
+    def test_auto_uses_host_capacity_for_shared_device_pool(self):
+        memory = SimpleNamespace(hicache_mamba_ratio="auto", hicache_ratio=2.0)
+        schedule = SimpleNamespace(chunked_prefill_size=4096, max_running_requests=9)
+        with (
+            patch(_ASSEMBLER + "get_memory", return_value=memory),
+            patch(_ASSEMBLER + "get_schedule", return_value=schedule),
+        ):
+            ratio = _resolve_mamba_host_ratio(
+                SimpleNamespace(size=988928),
+                SimpleNamespace(size=100, host_capacity_tokens=40),
+            )
+        self.assertEqual(int(40 * ratio) + 1, 251)
+
+    def test_auto_without_chunked_prefill_falls_back(self):
+        self.assertIsNone(self._resolve("auto", chunk=-1))
+
+
+class TestIndependentMambaHostBudget(CustomTestCase):
+    def test_fixed_budget_split_is_preserved_unless_mamba_ratio_is_set(self):
+        for with_swa in (False, True):
+            for value in (None, "6", "auto"):
+                with self.subTest(with_swa=with_swa, value=value), ExitStack() as stack:
+                    memory = SimpleNamespace(
+                        hicache_size=100,
+                        hicache_ratio=2.0,
+                        hicache_mamba_ratio=value,
+                        hicache_mem_layout="page_first_direct",
+                        hicache_write_policy="write_through",
+                        hicache_io_backend="direct",
+                        hicache_host_memory_mode="cache",
+                        enable_unified_memory=False,
+                    )
+                    schedule = SimpleNamespace(
+                        chunked_prefill_size=4096, max_running_requests=9
+                    )
+                    for name, obj in (
+                        ("get_memory", memory),
+                        ("get_schedule", schedule),
+                    ):
+                        stack.enter_context(patch(_ASSEMBLER + name, return_value=obj))
+                    kv_builder = stack.enter_context(
+                        patch(_ASSEMBLER + "build_kv_host_pool")
+                    )
+                    kv_builder.return_value.size = 988928
+                    mamba_builder = stack.enter_context(
+                        patch(_ASSEMBLER + "MambaPoolHost")
+                    )
+                    for name in (
+                        "_get_allocator_type",
+                        "build_pool_entry",
+                        "HostPoolGroup",
+                        "HybridCacheController",
+                    ):
+                        stack.enter_context(patch(_ASSEMBLER + name))
+                    params = MagicMock()
+                    params.mtp_draft_device_pools = ()
+                    kv_pool = _Pool(70 * 10**9 if with_swa else 90 * 10**9)
+                    mamba_pool = _Pool(10 * 10**9)
+                    mamba_pool.size = 40
+                    kwargs = dict(
+                        params=params,
+                        mamba_pool=mamba_pool,
+                        full_layer_mapping={0: 0},
+                        mamba_layer_mapping={1: 0},
+                        load_cache_event=None,
+                        storage_backend=None,
+                    )
+                    if with_swa:
+                        hybrid_pool_assembler.build_hybrid_mamba_swa_stack(
+                            **kwargs,
+                            full_kv_pool=kv_pool,
+                            swa_kv_pool=_Pool(20 * 10**9),
+                            swa_layer_mapping={2: 0},
+                            page_size=256,
+                            tp_group=None,
+                        )
+                    else:
+                        hybrid_pool_assembler.build_hybrid_mamba_stack(
+                            **kwargs, kv_pool=kv_pool, use_mla=False
+                        )
+                    budgets = [c.kwargs["host_size"] for c in kv_builder.call_args_list]
+                    ratio, mamba_budget = mamba_builder.call_args.args[1:3]
+                    if value is None:
+                        self.assertEqual(budgets, [70.0, 20.0] if with_swa else [90.0])
+                        self.assertEqual(mamba_budget, 10.0)
+                        self.assertEqual(ratio, 2.0)
+                    else:
+                        self.assertEqual(
+                            budgets,
+                            [100 * 70 / 90, 100 * 20 / 90] if with_swa else [None],
+                        )
+                        self.assertEqual(mamba_budget, 0)
+                        if value == "auto":
+                            self.assertEqual(int(40 * ratio) + 1, 251)
+                        else:
+                            self.assertEqual(ratio, 6.0)
 
 
 class TestHybridStageLayerMappings(CustomTestCase):

@@ -1,0 +1,38 @@
+[
+  {
+    "config": "base",
+    "seed": 1101,
+    "queue_s": 5.96621,
+    "forward_total_s": 0.27363
+  },
+  {
+    "config": "base",
+    "seed": 1102,
+    "queue_s": 3.6932600000000004,
+    "forward_total_s": 0.28764
+  },
+  {
+    "config": "base",
+    "seed": 1103,
+    "queue_s": 5.00611,
+    "forward_total_s": 0.26752
+  },
+  {
+    "config": "auto",
+    "seed": 1101,
+    "queue_s": 0.004019999999999999,
+    "forward_total_s": 0.27036
+  },
+  {
+    "config": "auto",
+    "seed": 1102,
+    "queue_s": 0.02332,
+    "forward_total_s": 0.25721
+  },
+  {
+    "config": "auto",
+    "seed": 1103,
+    "queue_s": 0.01678,
+    "forward_total_s": 0.27725
+  }
+]

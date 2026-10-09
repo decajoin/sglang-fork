@@ -1,0 +1,9 @@
+[2026-10-09 12:01:59 TP0] ReqTimeStats(rid=857f4ab303c043e99eacf70b68764f8e, input_len=131328, cached_input_len=131072, output_len=4, attempts=0, type=unified): queue_duration=5966.21ms, forward_duration=273.63ms, entry_time=1791518513.176
+[2026-10-09 12:03:52 TP0] ReqTimeStats(rid=344831836e5d475bb963f8a9baefaa0e, input_len=131328, cached_input_len=131072, output_len=4, attempts=0, type=unified): queue_duration=3693.26ms, forward_duration=287.64ms, entry_time=1791518628.297
+[2026-10-09 12:06:25 TP0] ReqTimeStats(rid=f93b5d73ccf543fa92b593c712ab3b39, input_len=131328, cached_input_len=131072, output_len=4, attempts=0, type=unified): queue_duration=5006.11ms, forward_duration=267.52ms, entry_time=1791518780.257
+[2026-10-09 12:01:59 TP0] HiCache prefetch success req=857f4ab303c043e99eacf70b68764f8e completed=131072 matched=126976 loaded=4096 occupied=0
+[2026-10-09 12:03:51 TP0] HiCache prefetch success req=344831836e5d475bb963f8a9baefaa0e completed=131072 matched=126976 loaded=4096 occupied=0
+[2026-10-09 12:06:25 TP0] HiCache prefetch success req=f93b5d73ccf543fa92b593c712ab3b39 completed=131072 matched=126976 loaded=4096 occupied=0
+[2026-10-09 12:01:53 TP0] ReqTimeStats(rid=99be4271c72c41f6a1b087be9b13553d, input_len=131328, cached_input_len=131072, output_len=4, attempts=0, type=unified): queue_duration=4.02ms, forward_duration=270.36ms, entry_time=1791518513.644
+[2026-10-09 12:03:45 TP0] ReqTimeStats(rid=6d5d27ecbcbc4dd496f1d2edb0d24e5a, input_len=131328, cached_input_len=131072, output_len=4, attempts=0, type=unified): queue_duration=23.32ms, forward_duration=257.21ms, entry_time=1791518624.935
+[2026-10-09 12:06:13 TP0] ReqTimeStats(rid=82b9b60ea2fc46d28e4f35d1ac143eb8, input_len=131328, cached_input_len=131072, output_len=4, attempts=0, type=unified): queue_duration=16.78ms, forward_duration=277.25ms, entry_time=1791518773.519

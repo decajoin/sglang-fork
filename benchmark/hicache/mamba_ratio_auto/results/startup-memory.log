@@ -1,0 +1,14 @@
+base: [2026-10-09 12:00:05 TP0] Allocating kv hierarchical KV host pool: 988928 tokens, 16.20 GB host memory.
+base: [2026-10-09 12:00:05 TP1] Allocating kv hierarchical KV host pool: 988928 tokens, 16.20 GB host memory.
+base: [2026-10-09 12:00:13 TP0] Allocating 3.18 GB host memory for hierarchical Mamba cache (layout=page_first_direct).
+base: [2026-10-09 12:00:13 TP1] Allocating 3.18 GB host memory for hierarchical Mamba cache (layout=page_first_direct).
+base: [2026-10-09 12:00:14 TP0] Allocating draft hierarchical KV host pool: 989184 tokens, 5.06 GB host memory.
+base: [2026-10-09 12:00:14 TP1] Allocating draft hierarchical KV host pool: 989184 tokens, 5.06 GB host memory.
+auto: [2026-10-09 12:00:05 TP0] Allocating kv hierarchical KV host pool: 988928 tokens, 16.20 GB host memory.
+auto: [2026-10-09 12:00:05 TP1] Allocating kv hierarchical KV host pool: 988928 tokens, 16.20 GB host memory.
+auto: [2026-10-09 12:00:13 TP0] --hicache-mamba-ratio auto: 988928 host KV tokens / chunk 4096 -> 251 host Mamba states (device 40, ratio 6.28).
+auto: [2026-10-09 12:00:13 TP0] Allocating 9.85 GB host memory for hierarchical Mamba cache (layout=page_first_direct).
+auto: [2026-10-09 12:00:13 TP1] --hicache-mamba-ratio auto: 988928 host KV tokens / chunk 4096 -> 251 host Mamba states (device 40, ratio 6.28).
+auto: [2026-10-09 12:00:13 TP1] Allocating 9.85 GB host memory for hierarchical Mamba cache (layout=page_first_direct).
+auto: [2026-10-09 12:00:17 TP0] Allocating draft hierarchical KV host pool: 989184 tokens, 5.06 GB host memory.
+auto: [2026-10-09 12:00:17 TP1] Allocating draft hierarchical KV host pool: 989184 tokens, 5.06 GB host memory.

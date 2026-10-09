@@ -1,0 +1,46 @@
+diff --git a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
+index 89482ce48c..15d4fee952 100644
+--- a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
++++ b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
+@@ -480,6 +480,24 @@ class HybridCacheController(BaseHiCacheController):
+         extra_pools: Optional[list[PoolTransfer]] = None,
+         *,
+         reclaim: Optional[Callable[[int], Any]] = None,
++    ) -> Optional[tuple[torch.Tensor, Optional[list[PoolTransfer]]]]:
++        res = self._alloc_host_p0(device_indices, extra_pools, reclaim=reclaim)  # P0TRACE
++        has_mamba = any(t.name == PoolName.MAMBA for t in (extra_pools or []))  # P0TRACE
++        if has_mamba:  # P0TRACE
++            mp = self.mem_pool_host.get_pool(PoolName.MAMBA)  # P0TRACE
++            self._p0_min_avail = min(getattr(self, "_p0_min_avail", 1 << 30), mp.available_size())  # P0TRACE
++            self._p0_n = getattr(self, "_p0_n", 0) + 1  # P0TRACE
++            self._p0_fail = getattr(self, "_p0_fail", 0) + (res is None)  # P0TRACE
++            if res is None or self._p0_n % 50 == 0:  # P0TRACE
++                logger.warning("P0TRACE alloc_host mamba n=%d fail=%d this_fail=%s kv_tokens=%d mamba_avail=%d min_avail=%d", self._p0_n, self._p0_fail, res is None, len(device_indices), mp.available_size(), self._p0_min_avail)  # P0TRACE
++        return res  # P0TRACE
++
++    def _alloc_host_p0(  # P0TRACE
++        self,
++        device_indices: torch.Tensor,
++        extra_pools: Optional[list[PoolTransfer]] = None,
++        *,
++        reclaim: Optional[Callable[[int], Any]] = None,
+     ) -> Optional[tuple[torch.Tensor, Optional[list[PoolTransfer]]]]:
+         if self._uses_shared_host_domain(extra_pools):
+             allocation = self.allocate_shared_host_transfers(
+@@ -1346,8 +1364,15 @@ class HybridCacheController(BaseHiCacheController):
+         operation.storage_start += trim_tokens
+
+     def _page_backup(self, operation):
++        t0 = time.perf_counter()  # P0TRACE
+         with self.mem_pool_host.layout_lease():
+-            return self._page_backup_with_stable_layout(operation)
++            r = self._page_backup_with_stable_layout(operation)
++        rate = float(os.environ.get("P0_L3_TOKENS_PER_S", "0"))  # P0TRACE: emulate slow shared L3
++        if rate > 0:  # P0TRACE
++            left = len(operation.hash_value) * self.page_size / rate - (time.perf_counter() - t0)  # P0TRACE
++            if left > 0:  # P0TRACE
++                time.sleep(left)  # P0TRACE
++        return r
+
+     def _page_backup_with_stable_layout(self, operation):
+         # MLA KV is replicated across TP ranks and should still be written only

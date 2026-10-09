@@ -112,6 +112,10 @@ class Memory(msgspec.Struct):
         int,
         "The size of host KV cache memory pool in gigabytes. Overrides --hicache-ratio in either host memory mode.",
     ] = 0
+    hicache_mamba_ratio: A[
+        Optional[str],
+        "The ratio of the host Mamba state pool to the device Mamba pool (in states), or 'auto'. Unset: follow --hicache-ratio / --hicache-size. When set, the host Mamba pool is sized independently and --hicache-size applies to the KV pools only. 'auto' sizes it to one state per chunked-prefill chunk the host KV pool holds, plus one per running request.",
+    ] = None
     hicache_host_memory_fraction: A[
         Optional[float],
         "Fraction of the available host memory, bounded by visible cgroup memory.max/memory.high or v1 memory limits (after a 10 GiB reserve) that the HiCache host pools of all ranks on this machine may use. Applies only when neither --hicache-ratio nor --hicache-size is set: the default ratio is then reduced until the pools fit. Lower it when several engines share a memory cgroup.",

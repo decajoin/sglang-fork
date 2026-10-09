@@ -1,0 +1,564 @@
+{
+  "base": {
+    "E1": {
+      "n": 3,
+      "mean": 5.159638896584511,
+      "p50": 5.276451252400875,
+      "p95": 6.22667964361608,
+      "maximum": 6.22667964361608,
+      "tokens": 393984,
+      "device": 0,
+      "host": 380928,
+      "storage": 12288,
+      "recompute": 768
+    },
+    "E1_rows": [
+      {
+        "config": "base",
+        "experiment": "E1_return",
+        "seed": 1101,
+        "fillers": 3,
+        "quiet": 0,
+        "input": 131328,
+        "ttft": 6.22667964361608,
+        "device": 0,
+        "host": 126976,
+        "storage": 4096,
+        "recompute": 256,
+        "output_ids": null,
+        "completion_tokens": 4
+      },
+      {
+        "config": "base",
+        "experiment": "E1_return",
+        "seed": 1102,
+        "fillers": 3,
+        "quiet": 20,
+        "input": 131328,
+        "ttft": 3.975785793736577,
+        "device": 0,
+        "host": 126976,
+        "storage": 4096,
+        "recompute": 256,
+        "output_ids": null,
+        "completion_tokens": 4
+      },
+      {
+        "config": "base",
+        "experiment": "E1_return",
+        "seed": 1103,
+        "fillers": 5,
+        "quiet": 20,
+        "input": 131328,
+        "ttft": 5.276451252400875,
+        "device": 0,
+        "host": 126976,
+        "storage": 4096,
+        "recompute": 256,
+        "output_ids": null,
+        "completion_tokens": 4
+      }
+    ],
+    "cold": {
+      "n": 14,
+      "mean": 20.43919325473585,
+      "p50": 20.41844217851758,
+      "p95": 20.82799877040088,
+      "maximum": 20.82799877040088,
+      "tokens": 1835008,
+      "device": 0,
+      "host": 0,
+      "storage": 0,
+      "recompute": 1835008
+    },
+    "E2": {
+      "n": 24,
+      "mean": 1.0473458021103095,
+      "p50": 0.42013437487185,
+      "p95": 2.6508460603654385,
+      "maximum": 2.728121155872941,
+      "tokens": 1646592,
+      "device": 0,
+      "host": 1568768,
+      "storage": 28672,
+      "recompute": 49152
+    },
+    "E2_turns": {
+      "0": {
+        "n": 12,
+        "mean": 7.190338097357501,
+        "p50": 7.196552977897227,
+        "p95": 7.211486617103219,
+        "maximum": 7.211486617103219,
+        "tokens": 786432,
+        "device": 0,
+        "host": 0,
+        "storage": 0,
+        "recompute": 786432
+      },
+      "1": {
+        "n": 12,
+        "mean": 1.674585541865478,
+        "p50": 2.379541336558759,
+        "p95": 2.728121155872941,
+        "maximum": 2.728121155872941,
+        "tokens": 811008,
+        "device": 0,
+        "host": 757760,
+        "storage": 28672,
+        "recompute": 24576
+      },
+      "2": {
+        "n": 12,
+        "mean": 0.42010606235514086,
+        "p50": 0.41953803412616253,
+        "p95": 0.42487041279673576,
+        "maximum": 0.42487041279673576,
+        "tokens": 835584,
+        "device": 0,
+        "host": 811008,
+        "storage": 0,
+        "recompute": 24576
+      }
+    },
+    "E3": {
+      "n": 6,
+      "mean": 10.89428534762313,
+      "p50": 9.992533328011632,
+      "p95": 17.400404823943973,
+      "maximum": 17.400404823943973,
+      "tokens": 787968,
+      "device": 0,
+      "host": 0,
+      "storage": 581632,
+      "recompute": 206336
+    },
+    "E3_rows": [
+      {
+        "config": "base",
+        "experiment": "E3_return",
+        "prompt": 0,
+        "input": 131328,
+        "ttft": 5.181472362950444,
+        "device": 0,
+        "host": 0,
+        "storage": 131072,
+        "recompute": 256,
+        "output_ids": null,
+        "output_text": "\u7684/10",
+        "completion_tokens": 4
+      },
+      {
+        "config": "base",
+        "experiment": "E3_return",
+        "prompt": 1,
+        "input": 131328,
+        "ttft": 13.11008276976645,
+        "device": 0,
+        "host": 0,
+        "storage": 86016,
+        "recompute": 45312,
+        "output_ids": null,
+        "output_text": " \t/ ",
+        "completion_tokens": 4
+      },
+      {
+        "config": "base",
+        "experiment": "E3_return",
+        "prompt": 2,
+        "input": 131328,
+        "ttft": 5.820473037660122,
+        "device": 0,
+        "host": 0,
+        "storage": 131072,
+        "recompute": 256,
+        "output_ids": null,
+        "output_text": "/the \t",
+        "completion_tokens": 4
+      },
+      {
+        "config": "base",
+        "experiment": "E3_return",
+        "prompt": 3,
+        "input": 131328,
+        "ttft": 6.874983886256814,
+        "device": 0,
+        "host": 0,
+        "storage": 131072,
+        "recompute": 256,
+        "output_ids": null,
+        "output_text": " \t/ ",
+        "completion_tokens": 4
+      },
+      {
+        "config": "base",
+        "experiment": "E3_return",
+        "prompt": 4,
+        "input": 131328,
+        "ttft": 16.978295205160975,
+        "device": 0,
+        "host": 0,
+        "storage": 53248,
+        "recompute": 78080,
+        "output_ids": null,
+        "output_text": " \u548c\u7684 ",
+        "completion_tokens": 4
+      },
+      {
+        "config": "base",
+        "experiment": "E3_return",
+        "prompt": 5,
+        "input": 131328,
+        "ttft": 17.400404823943973,
+        "device": 0,
+        "host": 0,
+        "storage": 49152,
+        "recompute": 82176,
+        "output_ids": null,
+        "output_text": " \t\"\n",
+        "completion_tokens": 4
+      }
+    ],
+    "E3_hit_ratio": 0.7395833333333334,
+    "drain": [
+      {
+        "config": "base",
+        "experiment": "E3_drain",
+        "seconds": 313.1445552650839,
+        "keys": 18874
+      }
+    ],
+    "sanity": [
+      {
+        "config": "base",
+        "experiment": "sanity_cold",
+        "input": 4096,
+        "ttft": 0.2931974530220032,
+        "device": 0,
+        "host": 0,
+        "storage": 0,
+        "recompute": 4096,
+        "output_ids": null,
+        "completion_tokens": 4
+      },
+      {
+        "config": "base",
+        "experiment": "sanity_l1",
+        "input": 4352,
+        "ttft": 0.21065504290163517,
+        "device": 4096,
+        "host": 0,
+        "storage": 0,
+        "recompute": 256,
+        "output_ids": null,
+        "completion_tokens": 4
+      }
+    ],
+    "host_alloc_log_GB_per_rank": {
+      "main_kv": 16.2,
+      "mamba": 3.18,
+      "draft_kv": 5.06
+    },
+    "allocation_trace": {
+      "0": {
+        "sampled_calls": 200,
+        "failures": 50,
+        "min_available_observed": 0
+      },
+      "1": {
+        "sampled_calls": 200,
+        "failures": 50,
+        "min_available_observed": 0
+      }
+    },
+    "process_PSS_GB": 60.257627136,
+    "scheduler_RSS_GB": [
+      28.71924736,
+      28.719132672
+    ]
+  },
+  "auto": {
+    "E1": {
+      "n": 3,
+      "mean": 0.2741937426229318,
+      "p50": 0.27080480568110943,
+      "p95": 0.2905656769871712,
+      "maximum": 0.2905656769871712,
+      "tokens": 393984,
+      "device": 0,
+      "host": 393216,
+      "storage": 0,
+      "recompute": 768
+    },
+    "E1_rows": [
+      {
+        "config": "auto",
+        "experiment": "E1_return",
+        "seed": 1101,
+        "fillers": 3,
+        "quiet": 0,
+        "input": 131328,
+        "ttft": 0.2612107452005148,
+        "device": 0,
+        "host": 131072,
+        "storage": 0,
+        "recompute": 256,
+        "output_ids": null,
+        "completion_tokens": 4
+      },
+      {
+        "config": "auto",
+        "experiment": "E1_return",
+        "seed": 1102,
+        "fillers": 3,
+        "quiet": 20,
+        "input": 131328,
+        "ttft": 0.27080480568110943,
+        "device": 0,
+        "host": 131072,
+        "storage": 0,
+        "recompute": 256,
+        "output_ids": null,
+        "completion_tokens": 4
+      },
+      {
+        "config": "auto",
+        "experiment": "E1_return",
+        "seed": 1103,
+        "fillers": 5,
+        "quiet": 20,
+        "input": 131328,
+        "ttft": 0.2905656769871712,
+        "device": 0,
+        "host": 131072,
+        "storage": 0,
+        "recompute": 256,
+        "output_ids": null,
+        "completion_tokens": 4
+      }
+    ],
+    "cold": {
+      "n": 14,
+      "mean": 20.50265324262104,
+      "p50": 20.47876967396587,
+      "p95": 20.88780894689262,
+      "maximum": 20.88780894689262,
+      "tokens": 1835008,
+      "device": 0,
+      "host": 0,
+      "storage": 0,
+      "recompute": 1835008
+    },
+    "E2": {
+      "n": 24,
+      "mean": 0.42140400743422407,
+      "p50": 0.42086465284228325,
+      "p95": 0.42539549246430397,
+      "maximum": 0.47285953909158707,
+      "tokens": 1646592,
+      "device": 0,
+      "host": 1597440,
+      "storage": 0,
+      "recompute": 49152
+    },
+    "E2_turns": {
+      "0": {
+        "n": 12,
+        "mean": 7.2103253134215874,
+        "p50": 7.210768456570804,
+        "p95": 7.2252141535282135,
+        "maximum": 7.2252141535282135,
+        "tokens": 786432,
+        "device": 0,
+        "host": 0,
+        "storage": 0,
+        "recompute": 786432
+      },
+      "1": {
+        "n": 12,
+        "mean": 0.4199441820383072,
+        "p50": 0.41476687975227833,
+        "p95": 0.47285953909158707,
+        "maximum": 0.47285953909158707,
+        "tokens": 811008,
+        "device": 0,
+        "host": 786432,
+        "storage": 0,
+        "recompute": 24576
+      },
+      "2": {
+        "n": 12,
+        "mean": 0.422863832830141,
+        "p50": 0.4222805695608258,
+        "p95": 0.42539549246430397,
+        "maximum": 0.42539549246430397,
+        "tokens": 835584,
+        "device": 0,
+        "host": 811008,
+        "storage": 0,
+        "recompute": 24576
+      }
+    },
+    "E3": {
+      "n": 6,
+      "mean": 5.135154333276053,
+      "p50": 5.057313493452966,
+      "p95": 5.705864995718002,
+      "maximum": 5.705864995718002,
+      "tokens": 787968,
+      "device": 0,
+      "host": 0,
+      "storage": 786432,
+      "recompute": 1536
+    },
+    "E3_rows": [
+      {
+        "config": "auto",
+        "experiment": "E3_return",
+        "prompt": 0,
+        "input": 131328,
+        "ttft": 5.705864995718002,
+        "device": 0,
+        "host": 0,
+        "storage": 131072,
+        "recompute": 256,
+        "output_ids": null,
+        "output_text": "\u7684/10",
+        "completion_tokens": 4
+      },
+      {
+        "config": "auto",
+        "experiment": "E3_return",
+        "prompt": 1,
+        "input": 131328,
+        "ttft": 5.034092353656888,
+        "device": 0,
+        "host": 0,
+        "storage": 131072,
+        "recompute": 256,
+        "output_ids": null,
+        "output_text": " \t/ ",
+        "completion_tokens": 4
+      },
+      {
+        "config": "auto",
+        "experiment": "E3_return",
+        "prompt": 2,
+        "input": 131328,
+        "ttft": 4.99065887928009,
+        "device": 0,
+        "host": 0,
+        "storage": 131072,
+        "recompute": 256,
+        "output_ids": null,
+        "output_text": "/the \t",
+        "completion_tokens": 4
+      },
+      {
+        "config": "auto",
+        "experiment": "E3_return",
+        "prompt": 3,
+        "input": 131328,
+        "ttft": 4.693384118378162,
+        "device": 0,
+        "host": 0,
+        "storage": 131072,
+        "recompute": 256,
+        "output_ids": null,
+        "output_text": " \t/ ",
+        "completion_tokens": 4
+      },
+      {
+        "config": "auto",
+        "experiment": "E3_return",
+        "prompt": 4,
+        "input": 131328,
+        "ttft": 5.080534633249044,
+        "device": 0,
+        "host": 0,
+        "storage": 131072,
+        "recompute": 256,
+        "output_ids": null,
+        "output_text": " \u548c\u7684 ",
+        "completion_tokens": 4
+      },
+      {
+        "config": "auto",
+        "experiment": "E3_return",
+        "prompt": 5,
+        "input": 131328,
+        "ttft": 5.306391019374132,
+        "device": 0,
+        "host": 0,
+        "storage": 131072,
+        "recompute": 256,
+        "output_ids": null,
+        "output_text": " \t\"\n",
+        "completion_tokens": 4
+      }
+    ],
+    "E3_hit_ratio": 1.0,
+    "drain": [
+      {
+        "config": "auto",
+        "experiment": "E3_drain",
+        "seconds": 403.83590646646917,
+        "keys": 25474
+      }
+    ],
+    "sanity": [
+      {
+        "config": "auto",
+        "experiment": "sanity_cold",
+        "input": 4096,
+        "ttft": 0.30535696260631084,
+        "device": 0,
+        "host": 0,
+        "storage": 0,
+        "recompute": 4096,
+        "output_ids": null,
+        "completion_tokens": 4
+      },
+      {
+        "config": "auto",
+        "experiment": "sanity_l1",
+        "input": 4352,
+        "ttft": 0.2076002936810255,
+        "device": 4096,
+        "host": 0,
+        "storage": 0,
+        "recompute": 256,
+        "output_ids": null,
+        "completion_tokens": 4
+      }
+    ],
+    "host_alloc_log_GB_per_rank": {
+      "main_kv": 16.2,
+      "mamba": 9.85,
+      "draft_kv": 5.06
+    },
+    "allocation_trace": {
+      "0": {
+        "sampled_calls": 150,
+        "failures": 0,
+        "min_available_observed": 103
+      },
+      "1": {
+        "sampled_calls": 150,
+        "failures": 0,
+        "min_available_observed": 103
+      }
+    },
+    "process_PSS_GB": 73.612424192,
+    "scheduler_RSS_GB": [
+      35.3816576,
+      35.380658176
+    ]
+  },
+  "validation": {
+    "auto_E1_full_L2": true,
+    "auto_E3_full_L3": true,
+    "auto_E2_lower_mean": true,
+    "all_requests_completed_4_tokens": true
+  }
+}

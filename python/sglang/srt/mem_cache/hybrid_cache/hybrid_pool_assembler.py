@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
@@ -28,7 +29,12 @@ from sglang.srt.mem_cache.pool_host.mha import (
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_parallel,
+    get_schedule,
+    get_serving,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -192,6 +198,57 @@ def _split_hicache_size(
         hicache_size * size_bytes / total_device_pool_size
         for size_bytes in device_pool_sizes
     )
+
+
+def _resolve_mamba_host_ratio(kv_host_pool: Any, mamba_pool: Any) -> Optional[float]:
+    """--hicache-mamba-ratio as a host/device state ratio; None follows --hicache-ratio.
+
+    'auto': a host KV page is restorable only while the Mamba state at its node
+    survives, and prefill caches one state per chunk. Size the host pool to one
+    state per chunk the host KV pool holds, plus one per running request for
+    prefetch staging and finish-time checkpoints.
+    """
+    value = get_memory().hicache_mamba_ratio
+    if value is None:
+        return None
+    if value != "auto":
+        try:
+            ratio = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"--hicache-mamba-ratio must be a number or 'auto', got {value!r}"
+            ) from None
+        if not math.isfinite(ratio) or ratio <= 0:
+            raise ValueError("--hicache-mamba-ratio must be finite and positive.")
+        return ratio
+    device_states = getattr(mamba_pool, "host_capacity_tokens", None)
+    if device_states is None:
+        device_states = mamba_pool.size
+    if device_states <= 0:
+        raise ValueError("--hicache-mamba-ratio auto needs a nonempty device pool.")
+    chunk = get_schedule().chunked_prefill_size
+    if chunk is None or chunk <= 0:
+        logger.warning(
+            "--hicache-mamba-ratio auto needs chunked prefill to bound state "
+            "density; falling back to --hicache-ratio=%s.",
+            get_memory().hicache_ratio,
+        )
+        return None
+    running = get_schedule().max_running_requests or 0
+    states = -(-kv_host_pool.size // chunk) + running
+    states = max(states, device_states + 1)
+    logger.info(
+        "--hicache-mamba-ratio auto: %d host KV tokens / chunk %d -> %d host "
+        "Mamba states (device %d, ratio %.2f).",
+        kv_host_pool.size,
+        chunk,
+        states,
+        device_states,
+        states / device_states,
+    )
+    # MambaPoolHost allocates int(device * ratio) + 1 slots. Target the final
+    # capacity, including that extra slot, with a half-slot rounding margin.
+    return (states - 0.5) / device_states
 
 
 def build_pool_entry(
@@ -1143,7 +1200,8 @@ def build_hybrid_mamba_stack(
         for pool in params.mtp_draft_device_pools
     )
     kv_host_size, mamba_host_size = None, 0
-    if get_memory().hicache_size > 0:
+    mamba_host_independent = get_memory().hicache_mamba_ratio is not None
+    if get_memory().hicache_size > 0 and not mamba_host_independent:
         kv_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (kv_pool, mamba_pool)
         )
@@ -1170,9 +1228,16 @@ def build_hybrid_mamba_stack(
         if get_memory().hicache_mem_layout == "page_first_kv_split"
         else get_memory().hicache_mem_layout
     )
+    # --hicache-mamba-ratio decouples the host Mamba pool from the KV split: host
+    # KV pages are only restorable while their trailing Mamba state survives.
+    mamba_host_ratio = _resolve_mamba_host_ratio(kv_host_pool, mamba_pool)
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        get_memory().hicache_ratio,
+        (
+            mamba_host_ratio
+            if mamba_host_ratio is not None
+            else get_memory().hicache_ratio
+        ),
         mamba_host_size,
         allocator_type=_get_allocator_type(),
         layout=mamba_layout,
@@ -1258,10 +1323,16 @@ def build_hybrid_mamba_swa_stack(
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
+    mamba_host_independent = get_memory().hicache_mamba_ratio is not None
     if get_memory().hicache_size > 0:
-        kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
-        )
+        if not mamba_host_independent:
+            kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
+                get_memory().hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
+            )
+        else:
+            kv_host_size, swa_host_size = _split_hicache_size(
+                get_memory().hicache_size, (full_kv_pool, swa_kv_pool)
+            )
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
         page_size=page_size,
@@ -1276,9 +1347,16 @@ def build_hybrid_mamba_swa_stack(
         host_size=swa_host_size,
         pool_label="swa",
     )
+    # --hicache-mamba-ratio decouples the host Mamba pool from the KV split: host
+    # KV pages are only restorable while their trailing Mamba state survives.
+    mamba_host_ratio = _resolve_mamba_host_ratio(kv_host_pool, mamba_pool)
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        get_memory().hicache_ratio,
+        (
+            mamba_host_ratio
+            if mamba_host_ratio is not None
+            else get_memory().hicache_ratio
+        ),
         mamba_host_size,
         allocator_type=_get_allocator_type(),
         layout=get_memory().hicache_mem_layout,
