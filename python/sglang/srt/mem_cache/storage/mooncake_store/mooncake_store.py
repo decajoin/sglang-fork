@@ -701,6 +701,29 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         assert self.store.get(warmup_key) == warmup_value
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+        namespace = getattr(mem_pool_host, "storage_namespace", None)
+        if namespace is not None:
+            if self.should_split_heads:
+                raise NotImplementedError(
+                    "FP4 Mooncake L3 does not support split heads."
+                )
+            if not all(
+                callable(getattr(self.store, name, None))
+                for name in (
+                    "batch_put_from_multi_buffers",
+                    "batch_get_into_multi_buffers",
+                )
+            ):
+                raise RuntimeError("FP4 L3 requires Mooncake multi-buffer I/O support.")
+            # Preserve tenant/model prefixes while isolating the physical format
+            # (including page geometry and optional native scale buffers).
+            if not getattr(self, "_fp4_namespace_registered", False):
+                self.config_prefix = (
+                    f"{self.config_prefix}_{namespace}"
+                    if self.config_prefix
+                    else namespace
+                )
+                self._fp4_namespace_registered = True
         super().register_mem_pool_host(mem_pool_host)
         if getattr(self.mem_pool_host, "kv_buffer", None) is None:
             # Hybrid logical anchors only own allocation indices. Their physical
@@ -723,7 +746,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return
         if host_pool_name == PoolName.DRAFT:
             self.registered_pools[host_pool_name] = host_pool
-            super().register_buffer(host_pool.kv_buffer)
+            for buf in self._iter_host_pool_buffers(host_pool):
+                super().register_buffer(buf)
             return
 
         # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
@@ -1369,9 +1393,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
         if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
+            results = self.store.batch_get_into_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes
             )
+            # A positive short read is not a hit: it may leave stale scales or
+            # payload in host memory. Only complete objects are restorable.
+            if len(results) != len(key_strs):
+                return [-1] * len(key_strs)
+            return [
+                result if result == sum(sizes) else -1
+                for result, sizes in zip(results, buffer_sizes)
+            ]
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
     def _batch_exist(
