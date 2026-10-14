@@ -464,9 +464,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         A hybrid backend can route TARGET_VERIFY to its decode child. That
         child's normal extend role belongs to FlashInfer, so its prefill flag
         is false even though this particular verify call must use the native
-        GenMHA decode layout.
+        decode layout (including SM90/SM120 XQA).
         """
-        return self.uses_trtllm_gen_native_fp4 and (
+        return self.is_nvfp4_kvcache and (
             self.prefill_uses_native_fp4
             or (
                 self.decode_uses_native_fp4
@@ -1554,6 +1554,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         cache_loc = forward_batch.out_cache_loc
         cp_active = is_cp_active(forward_batch)
         uses_native_fp4 = self._forward_extend_uses_native_fp4(forward_batch)
+        # Packed NVFP4 KV is shared by XQA and GenMHA, but only GenMHA
+        # requires FP8 Q/O. XQA verification keeps the model's BF16 Q/O.
+        uses_genmha_fp8_io = uses_native_fp4 and not self.is_xqa_impl
         if uses_native_fp4 and cp_active:
             raise NotImplementedError(
                 "Native NVFP4 TRT-LLM prefill does not yet support context parallelism."
@@ -1596,7 +1599,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     )
 
         q_scale = 1.0
-        if uses_native_fp4:
+        if uses_genmha_fp8_io:
             q = q.to(torch.float8_e4m3fn)
         elif (
             self.data_type == torch.float8_e4m3fn
@@ -1607,7 +1610,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             and not use_fused_qkv
         ):
             q = q.to(torch.float8_e4m3fn)
-        if self.use_fmha_v2:
+        if self.use_fmha_v2 or (uses_native_fp4 and self.is_xqa_impl):
             q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         else:
             q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1651,7 +1654,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
-        native_out = self._nvfp4_output_view(q) if uses_native_fp4 else None
+        native_out = self._nvfp4_output_view(q) if uses_genmha_fp8_io else None
 
         if is_decode_mode:
             if (
@@ -1682,7 +1685,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     sinks=attention_sink,
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                     out=native_out,
-                    out_dtype=(None if uses_native_fp4 else self.q_data_type),
+                    out_dtype=(None if uses_genmha_fp8_io else self.q_data_type),
                     kv_cache_sf=kv_cache_block_scales,
                     q_len_per_req=1,
                     multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
@@ -1701,7 +1704,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     sinks=attention_sink,
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                     out=native_out,
-                    out_dtype=(None if uses_native_fp4 else self.q_data_type),
+                    out_dtype=(None if uses_genmha_fp8_io else self.q_data_type),
                     kv_cache_sf=kv_cache_block_scales,
                     q_len_per_req=None,
                     max_q_len=self.forward_metadata.max_seq_len_q,
@@ -1725,7 +1728,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     window_left=layer.sliding_window_size,
                     sinks=attention_sink,
                     out=native_out,
-                    out_dtype=(None if uses_native_fp4 else self.q_data_type),
+                    out_dtype=(None if uses_genmha_fp8_io else self.q_data_type),
                     kv_cache_sf=kv_cache_block_scales,
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
                     mask=mask,
@@ -1791,7 +1794,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     sinks=attention_sink,
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
                     out=out,
-                    out_dtype=(None if uses_native_fp4 else self.q_data_type),
+                    out_dtype=(None if uses_genmha_fp8_io else self.q_data_type),
                     kv_cache_sf=kv_cache_block_scales,
                 )
 
@@ -1806,7 +1809,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     attention_backend=CPAttentionBackendKind.TRTLLM_MHA,
                 )
             else:
-                out = native_out if uses_native_fp4 else forward_batch._attn_output
+                out = native_out if uses_genmha_fp8_io else forward_batch._attn_output
                 if out is not None:
                     out = out.view_as(q)
                 o = _trtllm_context_attn(
@@ -1818,7 +1821,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     out=out,
                 )
 
-        if uses_native_fp4:
+        if uses_genmha_fp8_io:
             o = self._finalize_nvfp4_output(o, forward_batch)
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
