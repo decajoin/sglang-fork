@@ -1,5 +1,6 @@
 """Packed FP4 payload and its block scales must travel together through L2."""
 
+import ctypes
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -280,17 +281,203 @@ class TestFP4HostPool(unittest.TestCase):
             payload.assert_not_called()
         host.destroy()
 
-    def test_l3_rejected(self):
+    def test_flat_l3_rejected(self):
         host = make_host(make_pool())
         for fn, args in (
             (host.get_data_page, (0,)),
             (host.get_dummy_flat_data_page, ()),
             (host.set_from_flat_data_page, (0, None)),
-            (host.get_page_buffer_meta, (torch.arange(4),)),
+            (host.get_split_heads_page_buffer_meta, (torch.arange(4), 2)),
         ):
             with self.assertRaises(NotImplementedError):
                 fn(*args)
         host.destroy()
+
+    def test_l3_meta_covers_payload_and_scales_in_page_order(self):
+        for native in (False, True):
+            host = make_host(
+                make_pool(native=native), (make_pool(layers=1, native=native),)
+            )
+            ids = torch.tensor([8, 9, 10, 11, 0, 1, 2, 3])
+            ptrs, sizes = host.get_page_buffer_meta(ids)
+            payload_ptrs, payload_sizes = MHATokenToKVPoolHost.get_page_buffer_meta(
+                host, ids
+            )
+            for i, page in enumerate((2, 0)):
+                for kv, prefix in enumerate(("k_", "v_")):
+                    names = [
+                        n
+                        for n in host._scale_names
+                        if n.startswith(prefix) or n.startswith("native_" + prefix)
+                    ]
+                    self.assertEqual(ptrs[2 * i + kv][0], payload_ptrs[2 * i + kv])
+                    self.assertEqual(sizes[2 * i + kv][0], payload_sizes[2 * i + kv])
+                    for j, name in enumerate(names, 1):
+                        buf = getattr(host, f"_scale_host_{name}")
+                        self.assertEqual(ptrs[2 * i + kv][j], buf[page].data_ptr())
+                        self.assertEqual(sizes[2 * i + kv][j], buf[page].nbytes)
+            self.assertEqual(
+                host.get_page_buffer_meta(torch.empty(0, dtype=torch.int64)), ([], [])
+            )
+            for bad in (
+                torch.arange(1, 5),
+                torch.arange(3),
+                torch.tensor([0, 2, 1, 3]),
+                torch.arange(-4, 0),
+                torch.arange(host.size, host.size + 4),
+                torch.arange(4).float(),
+                torch.arange(4).reshape(1, 4),
+            ):
+                with self.assertRaises(ValueError):
+                    host.get_page_buffer_meta(bad)
+            host.destroy()
+
+    def test_mooncake_l3_cpu_roundtrip_and_incomplete_reads(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        class MemoryStore:
+            """CPU-only SDK double performing actual scatter/gather byte copies."""
+
+            def __init__(self):
+                self.objects = {}
+                self.registered = []
+
+            def register_buffer(self, ptr, size):
+                self.registered.append((ptr, size))
+                return 0
+
+            def batch_is_exist(self, keys):
+                return [int(k in self.objects) for k in keys]
+
+            def batch_put_from_multi_buffers(self, keys, ptrs, sizes, config):
+                for k, ps, ss in zip(keys, ptrs, sizes):
+                    self.objects[k] = b"".join(
+                        ctypes.string_at(p, s) for p, s in zip(ps, ss)
+                    )
+                return [0] * len(keys)
+
+            def batch_get_into_multi_buffers(self, keys, ptrs, sizes):
+                results = []
+                for k, ps, ss in zip(keys, ptrs, sizes):
+                    data = self.objects.get(k)
+                    if data is None:
+                        results.append(-1)
+                        continue
+                    offset = 0
+                    for p, s in zip(ps, ss):
+                        chunk = data[offset : offset + s]
+                        if chunk:
+                            ctypes.memmove(p, chunk, len(chunk))
+                        offset += s
+                    results.append(len(data))
+                return results
+
+            def batch_put_from(self, keys, ptrs, sizes):
+                return self.batch_put_from_multi_buffers(
+                    keys, [[p] for p in ptrs], [[s] for s in sizes], None
+                )
+
+            def batch_get_into(self, keys, ptrs, sizes):
+                return self.batch_get_into_multi_buffers(
+                    keys, [[p] for p in ptrs], [[s] for s in sizes]
+                )
+
+        for native in (False, True):
+            host = make_host(make_pool(native=native))
+            store = MooncakeStore.__new__(MooncakeStore)
+            store.store = MemoryStore()
+            store.config_prefix = "tenant_model"
+            store.is_mla_backend = False
+            store.should_split_heads = False
+            store.mha_suffix = "0"
+            store.pp_rank = 0
+            store.enable_storage_metrics = False
+            store._use_group_semantics = False
+            store._replicate_config_cls = SimpleNamespace
+            store.register_mem_pool_host(host)
+            prefix = store.config_prefix
+            store.register_mem_pool_host(host)
+            self.assertEqual(prefix, store.config_prefix)
+            self.assertIn("tenant_model_fp4-v1-nvfp4", prefix)
+            for buf in host.get_hybrid_pool_buffer():
+                self.assertIn((buf.data_ptr(), buf.nbytes), store.store.registered)
+                buf.copy_(torch.randint(0, 256, buf.shape, dtype=torch.uint8))
+            source = torch.arange(8)
+            destination = torch.arange(8, 16)
+            ptrs, sizes = host.get_page_buffer_meta(source)
+            expected = [
+                [ctypes.string_at(p, s) for p, s in zip(ps, ss)]
+                for ps, ss in zip(ptrs, sizes)
+            ]
+            self.assertEqual(store.batch_set_v1(["a", "b"], source), [True, True])
+            for buf in host.get_hybrid_pool_buffer():
+                buf.zero_()
+            self.assertEqual(store.batch_get_v1(["a", "b"], destination), [True, True])
+            ptrs, sizes = host.get_page_buffer_meta(destination)
+            actual = [
+                [ctypes.string_at(p, s) for p, s in zip(ps, ss)]
+                for ps, ss in zip(ptrs, sizes)
+            ]
+            self.assertEqual(actual, expected)
+            self.assertEqual(store.batch_exists(["a", "b"]), 2)
+            # The target format prefix also covers required hybrid sidecars.
+            # Exercise existing v2 routing without a model, GPU or server.
+            store.registered_pools = {}
+            transfers = []
+            for name in (PoolName.DRAFT, PoolName.MAMBA):
+                buffers = [
+                    torch.randint(0, 256, (4, 16), dtype=torch.uint8) for _ in range(2)
+                ]
+
+                def metadata(ids, buffers=buffers):
+                    return [
+                        b[int(p)].data_ptr() for p in ids[::4] // 4 for b in buffers
+                    ], [16] * (len(ids) // 4 * 2)
+
+                sidecar = SimpleNamespace(
+                    page_size=4,
+                    kv_buffer=buffers[0],
+                    conv_buffer=[buffers[1]],
+                    temporal_state_elem_size=16,
+                    get_hybrid_pool_buffer=lambda buffers=buffers: buffers,
+                    get_page_buffer_meta=metadata,
+                )
+                store.register_mem_host_pool_v2(sidecar, name)
+                transfer = PoolTransfer(name=name, keys=["a", "b"], host_indices=source)
+                self.assertEqual(store.batch_set_v2([transfer])[name], [True, True])
+                saved = [b[:2].clone() for b in buffers]
+                for b in buffers:
+                    b.zero_()
+                transfer.host_indices = destination
+                self.assertEqual(store.batch_get_v2([transfer])[name], [True, True])
+                for b, expected_buf in zip(buffers, saved):
+                    self.assertTrue(torch.equal(b[2:], expected_buf))
+                transfers.append(transfer)
+            self.assertEqual(
+                store.batch_exists_v2(["a", "b"], transfers).kv_hit_pages, 2
+            )
+            del store.store.objects[store._tag_keys(["b"])[0] + "_0_draft_v"]
+            self.assertEqual(
+                store.batch_exists_v2(["a", "b"], transfers).kv_hit_pages, 1
+            )
+            # Positive reads missing scales must not count as successful pages.
+            key = store._tag_keys(["a"])[0] + "_0_k"
+            store.store.objects[key] = store.store.objects[key][: sizes[0][0]]
+            self.assertEqual(store.batch_get_v1(["a", "b"], destination), [False, True])
+            del store.store.objects[key]
+            self.assertEqual(store.batch_exists(["a", "b"]), 0)
+            self.assertEqual(store.batch_get_v1(["a", "b"], destination), [False, True])
+            store.should_split_heads = True
+            with self.assertRaises(NotImplementedError):
+                store.register_mem_pool_host(host)
+            store.should_split_heads = False
+            store.store.batch_get_into_multi_buffers = None
+            with self.assertRaises(RuntimeError):
+                store.register_mem_pool_host(host)
+            host.destroy()
 
     def test_constructor_rejects_unsupported_geometry_before_allocation(self):
         pool = make_pool()

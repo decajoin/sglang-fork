@@ -35,8 +35,8 @@ Design (mirrors MHATokenToKVPoolMXFP8Host)
 * MTP draft layers pack into the tail layer of payload AND scale buffers.
 * Transfers must contain complete, aligned pages on both sides. Reject
   partial or misordered pages before writing payload or scales.
-* L3 flat storage is unsupported (scales live outside kv_buffer), the
-  same boundary the MXFP8 host pool keeps.
+* Mooncake L3 stores each K/V page as packed payload followed by its scale
+  buffers via multi-buffer I/O. Flat-storage backends remain unsupported.
 """
 
 from __future__ import annotations
@@ -440,12 +440,24 @@ class MHATokenToKVPoolFP4Host(MHATokenToKVPoolHost):
             setattr(self, f"_scale_dev_{name}", None)
         super().destroy()
 
-    # -- L3 flat storage: scales live outside kv_buffer --------------------------
+    # -- L3: one multi-buffer object per K/V page -----------------------------
+
+    @property
+    def storage_namespace(self) -> str:
+        """Versioned physical format; never share keys with unpacked KV pages."""
+        scales = "-".join(
+            f"{name}.{self._scale_page_bytes[name]}" for name in self._scale_names
+        )
+        return (
+            f"fp4-v1-{self.device_pool.quant_method.name}-pf"
+            f"-p{self.page_size}-l{self.layer_num}-h{self.head_num}"
+            f"-d{self.device_pool.head_dim}-{scales}"
+        )
 
     def _storage_pages_unsupported(self) -> NotImplementedError:
         return NotImplementedError(
-            "FP4 KV host pool does not expose flat storage (L3) pages yet: "
-            "a page's fp4 scales live outside kv_buffer."
+            "FP4 KV requires Mooncake multi-buffer L3 with page_first; "
+            "flat storage and split-head pages are unsupported."
         )
 
     def get_data_page(self, index, flat: bool = True):
@@ -458,7 +470,41 @@ class MHATokenToKVPoolFP4Host(MHATokenToKVPoolHost):
         raise self._storage_pages_unsupported()
 
     def get_page_buffer_meta(self, indices):
-        raise self._storage_pages_unsupported()
+        # Validate before exposing pointers to the storage SDK. Host indices
+        # may name nonconsecutive pages, but each page must be complete.
+        self._validate_storage_indices(indices)
+        payload_ptrs, payload_sizes = super().get_page_buffer_meta(indices)
+        ptrs, sizes = [], []
+        for i, page in enumerate(self._page_ids(indices).tolist()):
+            for kv, prefix in enumerate(("k_", "v_")):
+                object_ptrs = [payload_ptrs[2 * i + kv]]
+                object_sizes = [payload_sizes[2 * i + kv]]
+                for name in self._scale_names:
+                    if name.startswith(prefix) or name.startswith("native_" + prefix):
+                        buf = getattr(self, f"_scale_host_{name}")
+                        page_bytes = self.layer_num * self._scale_page_bytes[name]
+                        object_ptrs.append(buf.data_ptr() + page * page_bytes)
+                        object_sizes.append(page_bytes)
+                ptrs.append(object_ptrs)
+                sizes.append(object_sizes)
+        return ptrs, sizes
+
+    def _validate_storage_indices(self, indices):
+        if indices.device.type != "cpu":
+            raise ValueError("FP4 L3 indices must reside on CPU.")
+        if indices.ndim != 1 or indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError("FP4 L3 indices must be one-dimensional integers.")
+        if indices.numel() % self.page_size:
+            raise ValueError("FP4 L3 requires complete pages.")
+        rows = indices.reshape(-1, self.page_size)
+        starts = rows[:, :1]
+        if (
+            not torch.equal(rows, starts + torch.arange(self.page_size))
+            or bool((starts % self.page_size).any())
+            or bool((indices < 0).any())
+            or bool((indices >= self.size).any())
+        ):
+            raise ValueError("FP4 L3 requires aligned, ordered, in-range pages.")
 
     def get_split_heads_page_buffer_meta(
         self, indices: torch.Tensor, split_factor: int
