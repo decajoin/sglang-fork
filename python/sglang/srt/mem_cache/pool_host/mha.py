@@ -85,18 +85,21 @@ def prepare_mha_write_back_staging(
     head_num = device_pool.head_num
     if device_pool.head_dim == device_pool.v_head_dim:
         head_num = device_pool.row_dim // device_pool.head_dim
+    from sglang.srt.mem_cache.pool_host.mha_fp4 import is_fp4_packed_pool
+
+    pack_factor = 2 if is_fp4_packed_pool(device_pool) else 1
+    head_dims = tuple(
+        dim // pack_factor for dim in (device_pool.head_dim, device_pool.v_head_dim)
+    )
     if not all(
         can_use_write_back_jit_kernel(
             element_size=head_num * dim * device_pool.store_dtype.itemsize
         )
-        for dim in (device_pool.head_dim, device_pool.v_head_dim)
+        for dim in head_dims
     ):
         return None
     token_capacity = min(page_capacity, _WRITE_BACK_STAGING_PAGE_CHUNK) * page_size
-    shapes = tuple(
-        (token_capacity, layer_num, head_num, dim)
-        for dim in (device_pool.head_dim, device_pool.v_head_dim)
-    )
+    shapes = tuple((token_capacity, layer_num, head_num, dim) for dim in head_dims)
     staging = device_pool.hicache_write_back_staging
     if staging is None:
         staging = (
@@ -1512,6 +1515,7 @@ def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
 
     Returns ``MHATokenToKVPoolMXFP8Host`` for the block-scaled MXFP8 pool (its
     UE8M0 scales must travel with the payload),
+    ``MHATokenToKVPoolFP4Host`` for packed block-scaled FP4 pools,
     ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
     (e.g. MiMo-V2), else the default ``MHATokenToKVPoolHost``.
     """
@@ -1526,6 +1530,13 @@ def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
         )
 
         return MHATokenToKVPoolMXFP8Host
+    from sglang.srt.mem_cache.pool_host.mha_fp4 import (
+        MHATokenToKVPoolFP4Host,
+        is_fp4_packed_pool,
+    )
+
+    if is_fp4_packed_pool(device_pool):
+        return MHATokenToKVPoolFP4Host
     if device_pool.head_dim != device_pool.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost
     return MHATokenToKVPoolHost
