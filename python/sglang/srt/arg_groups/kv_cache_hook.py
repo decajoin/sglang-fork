@@ -24,11 +24,10 @@ logger = logging.getLogger(__name__)
 
 _NVFP4_PREFILL_BACKEND = {
     "fp8_e4m3": "flashinfer",
+    "bfloat16": "flashinfer",
     "nvfp4": "trtllm_mha",
 }
-_NVFP4_PREFILL_DEQUANT_DTYPE = {
-    backend: dtype for dtype, backend in _NVFP4_PREFILL_BACKEND.items()
-}
+_NVFP4_PREFILL_DEQUANT_DTYPE = {"flashinfer": "fp8_e4m3", "trtllm_mha": "nvfp4"}
 
 
 def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:

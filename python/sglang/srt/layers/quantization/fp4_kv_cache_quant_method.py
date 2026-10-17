@@ -34,7 +34,7 @@ Why do we need attention access rules?
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Iterable, Optional
 
@@ -449,6 +449,35 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
     name = "nvfp4"
     SCALE_BLOCK_SIZE = 16
 
+    def configure_attention_backends_from_server_args(self, server_args) -> None:
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        workspace_dtype = (
+            torch.bfloat16
+            if getattr(
+                resolved_view(server_args), "prefill_kv_cache_dequant_dtype", "auto"
+            )
+            == "bfloat16"
+            else torch.float8_e4m3fn
+        )
+        accesses = super().attention_accesses()
+        self._configured_attention_accesses = (
+            tuple(
+                replace(access, workspace_dtype=workspace_dtype)
+                if access.kind == KVCacheAttentionAccessKind.DEQUANT_WORKSPACE
+                else access
+                for access in accesses
+            )
+            if workspace_dtype == torch.bfloat16
+            else accesses
+        )
+        super().configure_attention_backends_from_server_args(server_args)
+
+    def attention_accesses(self) -> tuple[KVCacheAttentionAccess, ...]:
+        return getattr(
+            self, "_configured_attention_accesses", super().attention_accesses()
+        )
+
     def __init__(
         self,
         num_layers: int,
@@ -728,11 +757,30 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         v_scales: Tensor,
         layer_id: int,
     ) -> tuple[Tensor, Tensor]:
-        """Dequantize FP4 KV (indexed tokens) → FP8 E4M3."""
+        """Dequantize indexed NVFP4 KV with FP8 rounding into the workspace dtype."""
         from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
 
         cur_k_scale = self.k_scales_gpu[layer_id : layer_id + 1]
         cur_v_scale = self.v_scales_gpu[layer_id : layer_id + 1]
+        if self.dequant_workspace_dtype() == torch.bfloat16:
+            from sglang.srt.layers.quantization.nvfp4_kv_dequant import (
+                dequantize_nvfp4_to_fp8,
+            )
+
+            return (
+                dequantize_nvfp4_to_fp8(
+                    k_fp4.view(torch.uint8),
+                    k_scales,
+                    cur_k_scale,
+                    output_dtype=torch.bfloat16,
+                ),
+                dequantize_nvfp4_to_fp8(
+                    v_fp4.view(torch.uint8),
+                    v_scales,
+                    cur_v_scale,
+                    output_dtype=torch.bfloat16,
+                ),
+            )
         k_fp8 = NVFP4KVQuantizeUtil.dequantize(
             k_fp4.view(torch.uint8),
             k_scales,
@@ -1007,7 +1055,12 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
         _plain(_DECODE, _CPU_FP8_BACKENDS),
     ),
     NVFP4KVCacheMethod.name: (
-        _dq_workspace(_PREFILL, _NVFP4_DQ_KV_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),
+        _dq_workspace(
+            _PREFILL,
+            _NVFP4_DQ_KV_PREFILL_BACKENDS,
+            _NVFP4_SCALE,
+            _FP8_E4M3,
+        ),
         _native_fp4(_PREFILL, _NVFP4_KV_PREFILL_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
         _native_fp4(_DECODE, _NVFP4_KV_DECODE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
     ),

@@ -158,11 +158,13 @@ class ExecKernel(msgspec.Struct):
                 "Online dequantization dtype used by prefill attention when "
                 "--kv-cache-dtype=nvfp4. 'nvfp4' reads the packed cache directly "
                 "without additional dequantization; 'fp8_e4m3' dequantizes it "
-                "into a temporary FP8 workspace. This does not change the stored "
+                "into a temporary FP8 workspace; 'bfloat16' preserves those FP8 "
+                "values in a twice-as-large BF16 workspace to use BF16 attention "
+                "kernels. Neither option changes the stored "
                 "KV-cache dtype. 'auto' selects NVFP4 without additional "
                 "dequantization on SM100 and FP8 E4M3 otherwise."
             ),
-            choices=["auto", "nvfp4", "fp8_e4m3"],
+            choices=["auto", "nvfp4", "fp8_e4m3", "bfloat16"],
             resolvable=True,
         ),
     ] = "auto"

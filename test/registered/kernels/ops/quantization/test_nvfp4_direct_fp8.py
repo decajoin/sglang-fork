@@ -35,6 +35,7 @@ def test_large_history_uses_64_bit_element_offsets(count):
         *packed.stride(),
         *scales.stride(),
         BLOCK=1024,
+        EXPAND_FP8=False,
         enable_fp_fusion=False,
         grid=(1,),
     )
@@ -59,7 +60,8 @@ def reference(packed, scales, global_scale):
 
 
 @pytest.mark.parametrize("global_value", [1.0, 0.001, 0.37, 16.0])
-def test_all_codes_and_block_scales(global_value):
+@pytest.mark.parametrize("output_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_all_codes_and_block_scales(global_value, output_dtype):
     packed = (
         torch.arange(256, device="cuda")
         .to(torch.uint8)[None, None, :]
@@ -71,7 +73,10 @@ def test_all_codes_and_block_scales(global_value):
         .expand(256, 2, 32)
     )
     global_scale = torch.tensor([global_value], device="cuda")
-    result = dequantize_nvfp4_to_fp8(packed, scales, global_scale)
+    result = dequantize_nvfp4_to_fp8(
+        packed, scales, global_scale, output_dtype=output_dtype
+    )
+    assert result.dtype == output_dtype
     torch.testing.assert_close(
         result.float(),
         reference(packed, scales, global_scale).float(),
@@ -84,7 +89,8 @@ def test_all_codes_and_block_scales(global_value):
 @pytest.mark.parametrize(
     "tokens,heads,dim", [(0, 2, 256), (1, 2, 256), (3, 3, 64), (17, 2, 256)]
 )
-def test_strided_inputs_and_tail(tokens, heads, dim):
+@pytest.mark.parametrize("output_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_strided_inputs_and_tail(tokens, heads, dim, output_dtype):
     packed = torch.randint(
         256, (tokens * 2, heads, dim), dtype=torch.uint8, device="cuda"
     )[::2, :, ::2]
@@ -92,20 +98,26 @@ def test_strided_inputs_and_tail(tokens, heads, dim):
         torch.float8_e4m3fn
     )[::2, :, ::2]
     global_scale = torch.tensor([0.37], device="cuda")
-    result = dequantize_nvfp4_to_fp8(packed, scales, global_scale)
+    result = dequantize_nvfp4_to_fp8(
+        packed, scales, global_scale, output_dtype=output_dtype
+    )
+    assert result.dtype == output_dtype
     torch.testing.assert_close(
         result.float(), reference(packed, scales, global_scale).float(), rtol=0, atol=0
     )
 
 
-def test_cuda_graph_replay():
+@pytest.mark.parametrize("output_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_cuda_graph_replay(output_dtype):
     packed = torch.zeros((17, 2, 128), dtype=torch.uint8, device="cuda")
     scales = torch.ones((17, 2, 16), device="cuda").to(torch.float8_e4m3fn)
     global_scale = torch.ones(1, device="cuda")
-    dequantize_nvfp4_to_fp8(packed, scales, global_scale)
+    dequantize_nvfp4_to_fp8(packed, scales, global_scale, output_dtype=output_dtype)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        result = dequantize_nvfp4_to_fp8(packed, scales, global_scale)
+        result = dequantize_nvfp4_to_fp8(
+            packed, scales, global_scale, output_dtype=output_dtype
+        )
     packed.fill_(0x76)
     graph.replay()
     torch.testing.assert_close(

@@ -935,6 +935,18 @@ class TestKV4Compatibility(unittest.TestCase):
         )
 
     @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_prefill_bfloat16_workspace_selects_flashinfer(self):
+        args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dequant_dtype="bfloat16")
+        handle_nvfp4_prefill_kv_dequant_dtype(args)
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "flashinfer"
+        )
+        self.assertEqual(
+            resolution_result(args, "decode_attention_backend"), "trtllm_mha"
+        )
+        self.assertEqual(args.prefill_kv_cache_dequant_dtype, "bfloat16")
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
     def test_prefill_kv_dequant_dtype_rejects_native_prefill_off_sm100(self):
         args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dequant_dtype="nvfp4")
         with self.assertRaisesRegex(ValueError, "requires SM100"):

@@ -23,6 +23,21 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 self.assertEqual(args.dp_size, 3)
                 self.assertEqual(ServerArgs.from_cli_args(args).dp_size, 3)
 
+    def test_bfloat16_prefill_workspace_cli(self):
+        args = self.parser.parse_args(
+            [
+                "--model",
+                "dummy",
+                "--kv-cache-dtype",
+                "nvfp4",
+                "--prefill-kv-cache-dequant-dtype",
+                "bfloat16",
+            ]
+        )
+        self.assertEqual(
+            ServerArgs.from_cli_args(args).prefill_kv_cache_dequant_dtype, "bfloat16"
+        )
+
     def test_request_chat_template_requires_explicit_opt_in(self):
         for flags, expected in (([], False), (["--trust-request-chat-template"], True)):
             with self.subTest(flags=flags):

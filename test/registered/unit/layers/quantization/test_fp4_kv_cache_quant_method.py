@@ -34,6 +34,41 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         self.assertIn("fp4_mx_block16", KV_CACHE_QUANT_REGISTRY)
         self.assertIn("cpu_fp8_e4m3", KV_CACHE_QUANT_REGISTRY)
 
+    def test_nvfp4_workspace_dtype_is_per_instance_not_environment(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            NVFP4KVCacheMethod,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        methods = []
+        for dtype in ("bfloat16", "fp8_e4m3", "auto"):
+            method = NVFP4KVCacheMethod(1, "cpu", native_scale_layout=False)
+            args = ServerArgs(
+                model_path="dummy",
+                kv_cache_dtype="nvfp4",
+                prefill_attention_backend="flashinfer",
+                decode_attention_backend="trtllm_mha",
+                prefill_kv_cache_dequant_dtype=dtype,
+            )
+            method.configure_attention_backends_from_server_args(args)
+            methods.append(method)
+        with patch.dict("os.environ", {"SGLANG_EXPERIMENT_NVFP4_PREFILL_BF16": "1"}):
+            methods.append(NVFP4KVCacheMethod(1, "cpu", native_scale_layout=False))
+        self.assertEqual(
+            [m.dequant_workspace_dtype() for m in methods],
+            [
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fn,
+            ],
+        )
+        for method, dtype in zip(methods[:2], (torch.bfloat16, torch.float8_e4m3fn)):
+            buffers = method.create_buffers(16, 2, 64, 1, "cpu")
+            self.assertEqual(buffers["dq_k_buffer"].dtype, dtype)
+            self.assertEqual(buffers["dq_v_buffer"].dtype, dtype)
+            self.assertEqual(buffers["k_buffer"][0].dtype, torch.uint8)
+
     def test_factory_nvfp4(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVCacheMethod,

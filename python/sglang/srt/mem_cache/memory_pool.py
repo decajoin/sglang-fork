@@ -2816,12 +2816,16 @@ class MHATokenToKVPool(KVCache):
         if prepare_workspace:
             transfer_cur_kv = not use_ragged
             k_cur_fp8 = (
-                k_cur.to(torch.float8_e4m3fn)
+                k_cur.to(torch.float8_e4m3fn).to(
+                    self.quant_method.dequant_workspace_dtype()
+                )
                 if k_cur is not None and transfer_cur_kv
                 else None
             )
             v_cur_fp8 = (
-                v_cur.to(torch.float8_e4m3fn)
+                v_cur.to(torch.float8_e4m3fn).to(
+                    self.quant_method.dequant_workspace_dtype()
+                )
                 if v_cur is not None and transfer_cur_kv
                 else None
             )

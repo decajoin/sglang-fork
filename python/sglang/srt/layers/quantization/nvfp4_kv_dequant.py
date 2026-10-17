@@ -1,4 +1,4 @@
-"""Direct NVFP4 KV to FP8 conversion without a BF16 staging tensor."""
+"""Direct NVFP4 KV conversion with FP8 rounding and optional BF16 output."""
 
 import torch
 import triton
@@ -21,6 +21,7 @@ def _dequantize_fp8(
     S1: tl.constexpr,
     S2: tl.constexpr,
     BLOCK: tl.constexpr,
+    EXPAND_FP8: tl.constexpr,
 ):
     # Extend before multiplying: long histories can exceed 2**31 elements.
     i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
@@ -39,15 +40,22 @@ def _dequantize_fp8(
     value = tl.where((code & 8) != 0, -value, value)
     scale = tl.load(scales + b * S0 + h * S1 + (d // 16) * S2, valid, 0.0)
     value = value * scale.to(tl.float32) * tl.load(global_scale)
+    if EXPAND_FP8:
+        value = value.to(tl.float8e4nv).to(tl.float32)
     tl.store(output + i, value, valid)
 
 
-def dequantize_nvfp4_to_fp8(packed, block_scales, global_scale):
+def dequantize_nvfp4_to_fp8(
+    packed, block_scales, global_scale, output_dtype=torch.float8_e4m3fn
+):
     """Convert [tokens, heads, dim/2] packed E2M1 and linear E4M3 scales.
 
-    Only the FP8 output is allocated. Unpacking and scaling use registers;
-    strided input views do not require contiguous staging copies.
+    Only the output is allocated. Unpacking and scaling use registers;
+    strided input views do not require contiguous staging copies. BF16 output
+    preserves FP8 rounding in registers without allocating FP8 staging storage.
     """
+    if output_dtype not in (torch.float8_e4m3fn, torch.bfloat16):
+        raise ValueError("NVFP4 output must be FP8 E4M3 or BF16 with FP8 rounding")
     if packed.ndim != 3 or packed.dtype != torch.uint8:
         raise ValueError("NVFP4 data must be a three-dimensional uint8 tensor")
     b, h, half_d = packed.shape
@@ -65,7 +73,7 @@ def dequantize_nvfp4_to_fp8(packed, block_scales, global_scale):
     ):
         raise ValueError("NVFP4 inputs and scalar FP32 global scale must share a GPU")
     scales = block_scales.view(torch.float8_e4m3fn)
-    output = torch.empty((b, h, d), device=packed.device, dtype=torch.float8_e4m3fn)
+    output = torch.empty((b, h, d), device=packed.device, dtype=output_dtype)
     if output.numel():
         _dequantize_fp8[(triton.cdiv(output.numel(), 1024),)](
             packed,
@@ -78,6 +86,7 @@ def dequantize_nvfp4_to_fp8(packed, block_scales, global_scale):
             *packed.stride(),
             *scales.stride(),
             BLOCK=1024,
+            EXPAND_FP8=output_dtype == torch.bfloat16,
             enable_fp_fusion=False,
         )
     return output
