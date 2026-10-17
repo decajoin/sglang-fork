@@ -733,13 +733,19 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
 
         cur_k_scale = self.k_scales_gpu[layer_id : layer_id + 1]
         cur_v_scale = self.v_scales_gpu[layer_id : layer_id + 1]
-        k_bf16 = NVFP4KVQuantizeUtil.dequantize(
-            k_fp4.view(torch.uint8), k_scales, cur_k_scale
+        k_fp8 = NVFP4KVQuantizeUtil.dequantize(
+            k_fp4.view(torch.uint8),
+            k_scales,
+            cur_k_scale,
+            dtype=torch.float8_e4m3fn,
         )
-        v_bf16 = NVFP4KVQuantizeUtil.dequantize(
-            v_fp4.view(torch.uint8), v_scales, cur_v_scale
+        v_fp8 = NVFP4KVQuantizeUtil.dequantize(
+            v_fp4.view(torch.uint8),
+            v_scales,
+            cur_v_scale,
+            dtype=torch.float8_e4m3fn,
         )
-        return k_bf16.to(torch.float8_e4m3fn), v_bf16.to(torch.float8_e4m3fn)
+        return k_fp8, v_fp8
 
     def compute_cell_size(
         self, head_num: int, head_dim: int, num_layers: int, kv_size: int

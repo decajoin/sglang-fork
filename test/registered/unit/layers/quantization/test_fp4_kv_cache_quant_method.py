@@ -332,6 +332,32 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
             (swizzled_token[1, 4].item(), swizzled_scale[1, 4].item()), (2, 1)
         )
 
+    def test_history_dequantization_requests_fp8_without_bf16_intermediate(self):
+        from unittest.mock import patch
+
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            NVFP4KVCacheMethod,
+        )
+
+        method = NVFP4KVCacheMethod(num_layers=1, device="cpu")
+        packed = torch.zeros((3, 2, 128), dtype=torch.uint8)
+        scales = torch.ones((3, 2, 16), dtype=torch.float8_e4m3fn)
+
+        def dequantize(data, block_scales, global_scale, dtype=torch.bfloat16):
+            return torch.zeros((*data.shape[:-1], data.shape[-1] * 2), dtype=dtype)
+
+        with patch(
+            "sglang.srt.layers.quantization.kvfp4_tensor.NVFP4KVQuantizeUtil.dequantize",
+            side_effect=dequantize,
+        ) as kernel:
+            k, v = method.dequantize_prev_kv(packed, scales, packed, scales, 0)
+
+        self.assertEqual(k.dtype, torch.float8_e4m3fn)
+        self.assertEqual(v.dtype, torch.float8_e4m3fn)
+        self.assertEqual(kernel.call_count, 2)
+        for call in kernel.call_args_list:
+            self.assertEqual(call.kwargs.get("dtype"), torch.float8_e4m3fn)
+
     def test_scales_init(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVCacheMethod,
