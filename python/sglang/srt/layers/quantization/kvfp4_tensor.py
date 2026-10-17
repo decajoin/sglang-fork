@@ -223,7 +223,7 @@ class NVFP4KVQuantizeUtil:
         global_scale: torch.Tensor,
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
-        """Dequantize NVFP4 tensor to BF16/FP16.
+        """Dequantize NVFP4 tensor to BF16/FP16/FP8.
 
         Uses ``nvfp4_kv_dequantize`` on SM100+, falls back to pure PyTorch
         E2M1 LUT on SM90.
@@ -232,7 +232,7 @@ class NVFP4KVQuantizeUtil:
             quant_tensor: Packed FP4 data of shape [B, M, N/2] (uint8)
             block_scales: Per-block FP8 E4M3 scales of shape [B, M, N/16]
             global_scale: Global scale factor (float32)
-            dtype: Output dtype (bfloat16 or float16)
+            dtype: Output dtype (bfloat16, float16 or float8_e4m3fn)
 
         Returns:
             Dequantized tensor of shape [B, M, N]
@@ -253,6 +253,13 @@ class NVFP4KVQuantizeUtil:
             raise ValueError(
                 "NVFP4 global scale tensor must already be on the KV tensor device."
             )
+
+        if dtype == torch.float8_e4m3fn:
+            from sglang.srt.layers.quantization.nvfp4_kv_dequant import (
+                dequantize_nvfp4_to_fp8,
+            )
+
+            return dequantize_nvfp4_to_fp8(quant_tensor, block_scales, global_scale)
 
         if get_platform().is_sm100 or get_platform().is_sm120:
             from flashinfer import nvfp4_kv_dequantize
