@@ -1,0 +1,128 @@
+--- a/include/flashinfer/attention/prefill.cuh
++++ b/include/flashinfer/attention/prefill.cuh
+@@ -287,6 +287,7 @@
+   static constexpr PosEncodingMode POS_ENCODING_MODE = POS_ENCODING_MODE_;
+   using DTypeQ = DTypeQ_;
+   using DTypeKV = DTypeKV_;
++  using DTypeKVGlobal = DTypeKV_;
+   using DTypeO = DTypeO_;
+   using DTypeQKAccum = DTypeQKAccum_;
+   using IdType = IdType_;
+@@ -527,6 +528,6 @@
+ template <bool produce_v, typename KTraits, typename SmemStorage>
+ __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint32_t* smem_offset,
+-                                                typename KTraits::DTypeKV* kv_ptr,
++                                                typename KTraits::DTypeKVGlobal* kv_ptr,
+                                                 const uint32_t kv_idx_base,
+                                                 const size_t* thr_local_kv_offset,
+                                                 const uint32_t kv_len, const uint32_t warp_idx,
+@@ -555,10 +556,16 @@
+     static_assert(NUM_MMA_KV * 4 % NUM_WARPS_Q == 0);
+ #pragma unroll
+     for (uint32_t i = 0; i < NUM_MMA_KV * 4 / NUM_WARPS_Q; ++i) {
+-      DType* gptr = kv_ptr + thr_local_kv_offset[i];
++      auto* gptr = kv_ptr + thr_local_kv_offset[i];
+ #pragma unroll
+       for (uint32_t j = 0; j < NUM_MMA_D / (8 / sizeof(DType)); ++j) {
+-        if constexpr (IS_FP4) {
++        if constexpr (sizeof(typename KTraits::DTypeKVGlobal) == 1 && sizeof(DType) == 2) {
++          uint64_t packed = kv_idx < kv_len ? __ldg((const uint64_t*)gptr) : 0;
++          alignas(16) DType converted[8];
++          vec_cast<DType, typename KTraits::DTypeKVGlobal>::template cast<8>(
++              converted, (typename KTraits::DTypeKVGlobal*)&packed);
++          smem.base[*smem_offset] = *(b128_t*)converted;
++        } else if constexpr (IS_FP4) {
+           // Load 64b from packed GMEM into lower 64b of 128b SMEM slot (upper 64b zeroed)
+           smem.load_64b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+         } else {
+@@ -580,7 +587,7 @@
+     static_assert(NUM_MMA_KV * 2 % NUM_WARPS_Q == 0);
+ #pragma unroll
+     for (uint32_t i = 0; i < NUM_MMA_KV * 2 / NUM_WARPS_Q; ++i) {
+-      DType* gptr = kv_ptr + thr_local_kv_offset[i];
++      auto* gptr = kv_ptr + thr_local_kv_offset[i];
+       if constexpr (IS_FP4) {
+         smem.load_64b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+       } else {
+@@ -620,6 +627,6 @@
+ template <bool produce_v, typename KTraits, typename SmemStorage, typename PagedKV>
+ __device__ __forceinline__ void page_produce_kv_on_the_fly(
+-    SmemStorage* smem_storage, uint32_t* smem_offset, typename KTraits::DTypeKV* kv_ptr,
++    SmemStorage* smem_storage, uint32_t* smem_offset, typename KTraits::DTypeKVGlobal* kv_ptr,
+     const PagedKV& paged_kv, const uint32_t packed_page_iter_base,
+     const typename KTraits::IdType last_indptr, const uint32_t kv_head_idx,
+     const uint32_t kv_idx_base, const uint32_t kv_len, const uint32_t warp_idx,
+@@ -645,12 +652,18 @@
+     for (uint32_t i = 0; i < NUM_MMA_KV * ROWS_PER_ITER / NUM_WARPS_Q; ++i) {
+       const uint32_t logical_row =
+           warp_idx * ROWS_PER_ITER + lane_idx / 8 + NUM_WARPS * ROWS_PER_ITER * i;
+-      DType* gptr = kv_ptr + get_paged_kv_offset_for_logical_row<produce_v, KTraits>(
++      auto* gptr = kv_ptr + get_paged_kv_offset_for_logical_row<produce_v, KTraits>(
+                                  paged_kv, packed_page_iter_base, last_indptr, kv_head_idx,
+                                  logical_row, lane_idx);
+ #pragma unroll
+       for (uint32_t j = 0; j < NUM_MMA_D / (8 / sizeof(DType)); ++j) {
+-        if constexpr (IS_FP4) {
++        if constexpr (sizeof(typename KTraits::DTypeKVGlobal) == 1 && sizeof(DType) == 2) {
++          uint64_t packed = kv_idx < kv_len ? __ldg((const uint64_t*)gptr) : 0;
++          alignas(16) DType converted[8];
++          vec_cast<DType, typename KTraits::DTypeKVGlobal>::template cast<8>(
++              converted, (typename KTraits::DTypeKVGlobal*)&packed);
++          smem.base[*smem_offset] = *(b128_t*)converted;
++        } else if constexpr (IS_FP4) {
+           smem.template load_64b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+         } else {
+           smem.template load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+@@ -3774,7 +3787,7 @@
+           // FP4: GMEM is packed (2 FP4/byte), so the column byte offset is halved relative to fp8
+           constexpr uint32_t fp4_pack_factor = is_fp4_type_v<DTypeKV> ? 2 : 1;
+           const uint32_t feat_idx =
+-              (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack_factor;
++              (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<typename KTraits::DTypeKV>() / fp4_pack_factor;
+           thr_local_kv_offset_k[i] = paged_kv.protective_get_k_offset(
+               page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
+           thr_local_kv_offset_v[i] = paged_kv.protective_get_v_offset(
+@@ -3881,7 +3894,7 @@
+             // FP4: GMEM is packed (2 FP4/byte), so the column byte offset is halved relative to fp8
+             constexpr uint32_t fp4_pack_factor = is_fp4_type_v<DTypeKV> ? 2 : 1;
+             const uint32_t feat_idx =
+-                (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack_factor;
++                (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<typename KTraits::DTypeKV>() / fp4_pack_factor;
+             thr_local_kv_offset_k[i] = paged_kv.protective_get_k_offset(
+                 page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
+             thr_local_kv_offset_v[i] = paged_kv.protective_get_v_offset(
+@@ -4130,3 +4143,8 @@
++template <typename Base, typename Global>
++struct GlobalUpcastTraits : Base {
++  using DTypeKVGlobal = Global;
++};
++
+ template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
+           typename AttentionVariant, typename Params>
+@@ -4336,7 +4354,13 @@
+                                                    float* tmp_s, bool enable_pdl,
+                                                    cudaStream_t stream) {
+   using DTypeQ = typename Params::DTypeQ;
++#ifdef SGLANG_FP8_PREFILL_LOAD_UPCAST
++  using DTypeKV = std::conditional_t<sizeof(typename Params::DTypeKV) == 1 &&
++                                       HEAD_DIM_QK == 256 && HEAD_DIM_VO == 256,
++                                   DTypeQ, typename Params::DTypeKV>;
++#else
+   using DTypeKV = typename Params::DTypeKV;
++#endif
+   using DTypeO = typename Params::DTypeO;
+   const uint32_t padded_batch_size = params.padded_batch_size;
+   const uint32_t num_qo_heads = params.num_qo_heads;
+@@ -4436,9 +4460,10 @@
+   DISPATCH_NUM_MMA_KV(
+       min(static_cast<uint32_t>(max_num_mma_kv_smem), max_num_mma_kv_reg), NUM_MMA_KV, {
+-        using KTraits =
++        using KTraitsBase =
+             KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
+                          NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
+                          DTypeQKAccum, typename Params::IdType, AttentionVariant>;
++        using KTraits = GlobalUpcastTraits<KTraitsBase, typename Params::DTypeKV>;
+         if constexpr (KTraits::IsInvalid()) {
+           // Invalid configuration, skip
+           std::ostringstream err_msg;

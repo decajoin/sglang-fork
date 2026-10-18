@@ -362,6 +362,9 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             else model_runner.kv_cache_dtype
         )
+        self._paged_prefill_wrapper_cls = self._select_paged_prefill_wrapper_cls(
+            model_runner.server_args
+        )
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
@@ -505,7 +508,7 @@ class FlashInferAttnBackend(AttentionBackend):
         for _ in range(self.num_wrappers):
             if not skip_prefill:
                 self.prefill_wrappers_paged.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
+                    self._make_paged_prefill_wrapper(
                         self.workspace_buffer,
                         "NHD",
                         backend=self.prefill_backend,
@@ -546,6 +549,26 @@ class FlashInferAttnBackend(AttentionBackend):
         self.full_cg_prefill_wrappers: Optional[
             List[BatchPrefillWithPagedKVCacheWrapper]
         ] = None
+
+    def _select_paged_prefill_wrapper_cls(self, server_args):
+        # The loader consumes FP8 tensors, whether they are native KV buffers
+        # or an NVFP4 dequant workspace. It never expands global KV storage.
+        if (
+            getattr(server_args, "enable_fp8_prefill_workspace_optimization", False)
+            and self.flashinfer_kv_cache_dtype == torch.float8_e4m3fn
+        ):
+            from sglang.kernels.ops.attention.fp8_prefill import (
+                FP8PrefillWorkspaceWrapper,
+            )
+
+            return FP8PrefillWorkspaceWrapper
+        return BatchPrefillWithPagedKVCacheWrapper
+
+    def _make_paged_prefill_wrapper(self, *args, **kwargs):
+        cls = getattr(
+            self, "_paged_prefill_wrapper_cls", BatchPrefillWithPagedKVCacheWrapper
+        )
+        return cls(*args, **kwargs)
 
     def _check_kv_attention_access(self, phase: str, access) -> None:
         if access is not None:
@@ -1249,7 +1272,7 @@ class FlashInferAttnBackend(AttentionBackend):
             for _ in range(self.num_wrappers)
         ]
         return [
-            BatchPrefillWithPagedKVCacheWrapper(
+            self._make_paged_prefill_wrapper(
                 self.full_cg_prefill_workspace_buffer,
                 "NHD",
                 use_cuda_graph=True,

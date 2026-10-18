@@ -508,6 +508,7 @@ POSITIONAL_FIELD_ORDER = (
     "flashinfer_a2a_dispatch_type",
     "cuda_graph_max_seq_len_prefill",
     "prefill_kv_cache_dequant_dtype",
+    "enable_fp8_prefill_workspace_optimization",
     "dsv4_attn_backend",
     "otlp_service_name",
     "_radix_eviction_policy_explicitly_set",

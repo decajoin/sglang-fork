@@ -947,6 +947,127 @@ class TestKV4Compatibility(unittest.TestCase):
         self.assertEqual(args.prefill_kv_cache_dequant_dtype, "bfloat16")
 
     @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_optimized_fp8_workspace_accepts_auto_on_sm120(self):
+        args = self._make_unrouted_nvfp4_args(
+            enable_fp8_prefill_workspace_optimization=True
+        )
+        handle_nvfp4_prefill_kv_dequant_dtype(args)
+        self.assertEqual(
+            resolution_result(args, "prefill_kv_cache_dequant_dtype"), "fp8_e4m3"
+        )
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "flashinfer"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_optimized_fp8_workspace_rejects_bfloat16_and_native(self):
+        for dtype in ("bfloat16", "nvfp4"):
+            args = self._make_unrouted_nvfp4_args(
+                prefill_kv_cache_dequant_dtype=dtype,
+                enable_fp8_prefill_workspace_optimization=True,
+            )
+            with self.assertRaisesRegex(ValueError, "requires.*fp8_e4m3"):
+                handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_optimized_fp8_workspace_rejects_other_architectures(self):
+        args = self._make_unrouted_nvfp4_args(
+            enable_fp8_prefill_workspace_optimization=True
+        )
+        with self.assertRaisesRegex(ValueError, "requires SM120"):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_optimized_fp8_workspace_rejects_other_storage(self):
+        for dtype in ("auto", "bfloat16", "fp8_e5m2", "mxfp8", "fp4_mx_block16"):
+            args = ServerArgs(
+                model_path="dummy",
+                kv_cache_dtype=dtype,
+                enable_fp8_prefill_workspace_optimization=True,
+            )
+            with (
+                self.subTest(dtype=dtype),
+                self.assertRaisesRegex(ValueError, "requires.*nvfp4 or fp8_e4m3"),
+            ):
+                handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_optimized_loader_accepts_native_fp8_without_dequantization(self):
+        for backends in (
+            {},
+            dict(attention_backend="flashinfer"),
+            dict(
+                attention_backend="trtllm_mha",
+                prefill_attention_backend="flashinfer",
+                decode_attention_backend="trtllm_mha",
+            ),
+        ):
+            args = ServerArgs(
+                model_path="dummy",
+                kv_cache_dtype="fp8_e4m3",
+                enable_fp8_prefill_workspace_optimization=True,
+                **backends,
+            )
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+            self.assertEqual(
+                resolution_result(args, "prefill_attention_backend"), "flashinfer"
+            )
+            self.assertEqual(
+                resolution_result(args, "decode_attention_backend"),
+                backends.get("decode_attention_backend"),
+            )
+            self.assertEqual(args.prefill_kv_cache_dequant_dtype, "auto")
+            self.assertEqual(args.kv_cache_dtype, "fp8_e4m3")
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_native_fp8_loader_rejects_conflicting_prefill(self):
+        for backends in (
+            dict(attention_backend="trtllm_mha"),
+            dict(attention_backend="flashinfer", prefill_attention_backend="fa3"),
+        ):
+            args = ServerArgs(
+                model_path="dummy",
+                kv_cache_dtype="fp8_e4m3",
+                enable_fp8_prefill_workspace_optimization=True,
+                **backends,
+            )
+            with self.assertRaisesRegex(
+                ValueError, "prefill-attention-backend=flashinfer"
+            ):
+                handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_native_fp8_loader_does_not_accept_dequant_option(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="fp8_e4m3",
+            prefill_kv_cache_dequant_dtype="fp8_e4m3",
+            enable_fp8_prefill_workspace_optimization=True,
+        )
+        with self.assertRaisesRegex(ValueError, "applies only"):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_native_fp8_loader_rejects_other_architectures(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="fp8_e4m3",
+            enable_fp8_prefill_workspace_optimization=True,
+        )
+        with self.assertRaisesRegex(ValueError, "requires SM120"):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    def test_native_fp8_without_optimization_preserves_backends(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="fp8_e4m3",
+            attention_backend="trtllm_mha",
+        )
+        handle_nvfp4_prefill_kv_dequant_dtype(args)
+        self.assertIsNone(resolution_result(args, "prefill_attention_backend"))
+        self.assertIsNone(resolution_result(args, "decode_attention_backend"))
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
     def test_prefill_kv_dequant_dtype_rejects_native_prefill_off_sm100(self):
         args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dequant_dtype="nvfp4")
         with self.assertRaisesRegex(ValueError, "requires SM100"):

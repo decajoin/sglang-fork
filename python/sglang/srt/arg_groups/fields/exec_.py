@@ -168,6 +168,13 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+    enable_fp8_prefill_workspace_optimization: A[
+        bool,
+        "Use the optimized FlashInfer FA2 FP8 loader on SM120 for FP8 E4M3 KV "
+        "or NVFP4 KV with FP8 E4M3 dequantization. BF16-Q/D256 full-attention plans use "
+        "BF16 shared tiles without a larger global workspace. Other signatures "
+        "retain upstream kernels. Opt-in: not bit-exact to the original FP8 kernel.",
+    ] = False
     sampling_backend: A[
         Optional[str],
         Arg(

@@ -38,6 +38,37 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
             ServerArgs.from_cli_args(args).prefill_kv_cache_dequant_dtype, "bfloat16"
         )
 
+    def test_fp8_prefill_workspace_optimization_is_opt_in(self):
+        for flags, expected in (
+            ([], False),
+            (["--enable-fp8-prefill-workspace-optimization"], True),
+        ):
+            args = self.parser.parse_args(["--model", "dummy", *flags])
+            self.assertIs(
+                ServerArgs.from_cli_args(
+                    args
+                ).enable_fp8_prefill_workspace_optimization,
+                expected,
+            )
+
+    def test_native_fp8_prefill_loader_cli_without_dequant_option(self):
+        args = self.parser.parse_args(
+            [
+                "--model",
+                "dummy",
+                "--kv-cache-dtype",
+                "fp8_e4m3",
+                "--prefill-attention-backend",
+                "flashinfer",
+                "--enable-fp8-prefill-workspace-optimization",
+            ]
+        )
+        server_args = ServerArgs.from_cli_args(args)
+        self.assertTrue(server_args.enable_fp8_prefill_workspace_optimization)
+        self.assertEqual(server_args.kv_cache_dtype, "fp8_e4m3")
+        self.assertEqual(server_args.prefill_attention_backend, "flashinfer")
+        self.assertEqual(server_args.prefill_kv_cache_dequant_dtype, "auto")
+
     def test_request_chat_template_requires_explicit_opt_in(self):
         for flags, expected in (([], False), (["--trust-request-chat-template"], True)):
             with self.subTest(flags=flags):

@@ -31,15 +31,40 @@ _NVFP4_PREFILL_DEQUANT_DTYPE = {"flashinfer": "fp8_e4m3", "trtllm_mha": "nvfp4"}
 
 
 def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
-    """Resolve the public prefill dequantization dtype to attention backends."""
+    """Resolve NVFP4 dequantization and opt-in native FP8 prefill routing."""
 
     cfg = resolving_view(server_args)
     requested_dtype = cfg.prefill_kv_cache_dequant_dtype
+    optimized_fp8 = cfg.enable_fp8_prefill_workspace_optimization
+    if optimized_fp8:
+        if cfg.kv_cache_dtype not in ("nvfp4", "fp8_e4m3"):
+            raise ValueError(
+                "--enable-fp8-prefill-workspace-optimization requires "
+                "--kv-cache-dtype=nvfp4 or fp8_e4m3."
+            )
+        if not get_platform().is_sm120:
+            raise ValueError(
+                "FP8 prefill workspace optimization currently requires SM120."
+            )
     if cfg.kv_cache_dtype != "nvfp4":
         if requested_dtype != "auto":
             raise ValueError(
                 "--prefill-kv-cache-dequant-dtype applies only with "
                 "--kv-cache-dtype=nvfp4."
+            )
+        if optimized_fp8:
+            explicit_backend = cfg.prefill_attention_backend or cfg.attention_backend
+            if explicit_backend not in (None, "flashinfer"):
+                raise ValueError(
+                    "--enable-fp8-prefill-workspace-optimization requires "
+                    "--prefill-attention-backend=flashinfer for FP8 KV."
+                )
+            # Native FP8 needs no dequantization workspace. Select only prefill;
+            # preserve the caller's decode backend and stored KV buffers.
+            declare_resolution(
+                server_args,
+                "_handle_nvfp4_prefill_kv_dequant_dtype",
+                prefill_attention_backend="flashinfer",
             )
         return
 
@@ -54,6 +79,13 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
                     f"NVFP4, but backend {explicit_backend!r} provides neither."
                 )
             requested_dtype = "nvfp4" if get_platform().is_sm100 else "fp8_e4m3"
+
+    if optimized_fp8 and requested_dtype != "fp8_e4m3":
+        raise ValueError(
+            "--enable-fp8-prefill-workspace-optimization requires "
+            "--prefill-kv-cache-dequant-dtype=fp8_e4m3, not "
+            f"{requested_dtype!r}. It cannot be combined with a BF16 workspace."
+        )
 
     if requested_dtype == "nvfp4" and not get_platform().is_sm100:
         raise ValueError(
